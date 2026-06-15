@@ -13,7 +13,7 @@ authors = [{ name = "Thomas Sawyer", email = "transfire@gmail.com" }]
 keywords = ["c0", "c0data", "data-format", "control-codes"]
 
 [project.urls]
-Repository = "https://github.com/trans/c0-py"
+Repository = "https://github.com/c0data/c0-py"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

@@ -1,10 +1,10 @@
 # c0
 
-A Python implementation of [C0DATA](https://github.com/trans/c0data) — structured
+A Python implementation of [C0DATA](https://github.com/c0data/c0-cr) — structured
 data built on ASCII C0 control codes.
 
 This is **not** a reimplementation: it's a thin, fast binding over the
-[c0 C core](https://github.com/trans/c0-c) (a CPython extension, no third-party
+[c0 C core](https://github.com/c0data/c0-c) (a CPython extension, no third-party
 dependencies), so the scan-heavy work runs as native C while the Python layer
 provides an idiomatic API. The read path is **zero-copy** — accessors return
 `memoryview` slices into the input buffer.
@@ -52,7 +52,7 @@ Requires a C compiler and the Python development headers.
 Binds the c0-c core: tokenizer, table/record and document/group readers (zero-copy),
 canonical helpers, ETB stream mode, and pretty (`pretty_format`/`pretty_parse`).
 The builder is pure Python (byte-identical to the C builder). Passes the shared
-conformance vectors from [c0-spec](https://github.com/trans/c0-spec).
+conformance vectors from [c0-spec](https://github.com/c0data/c0-spec).
 
 Converters (CSV / JSON / C0DIFF) are not yet wrapped.
 
