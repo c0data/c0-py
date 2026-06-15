@@ -1,6 +1,6 @@
 # c0
 
-A Python implementation of [C0DATA](https://github.com/c0data/c0-cr) — structured
+A Python implementation of [C0DATA](https://github.com/c0data) — structured
 data built on ASCII C0 control codes.
 
 This is **not** a reimplementation: it's a thin, fast binding over the
