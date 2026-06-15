@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "c0"
+version = "0.1.0"
+description = "C0DATA — structured data using ASCII C0 control codes (Python binding over the c0 C core)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [{ name = "Thomas Sawyer", email = "transfire@gmail.com" }]
+keywords = ["c0", "c0data", "data-format", "control-codes"]
+
+[project.urls]
+Repository = "https://github.com/trans/c0-py"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["c0"]
