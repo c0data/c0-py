@@ -68,6 +68,31 @@ class Encode(unittest.TestCase):
                 self.assertTrue(c0.canonical(b.bytes))
 
 
+class ListField(unittest.TestCase):
+    def test_list(self):
+        for c in cases("list.json"):
+            with self.subTest(c["name"]):
+                buf = hexbytes(c["bytes"])
+                rec = c0.Table(buf).record(0)
+                entries = c["record"]
+                self.assertEqual(len(rec), len(entries))
+                for i, e in enumerate(entries):
+                    if isinstance(e, list):
+                        self.assertEqual(rec.list(i), [field_bytes(x) for x in e])
+                    else:
+                        self.assertEqual(rec.value(i), field_bytes(e))
+                if c["canonical"]:
+                    b = c0.Builder()
+                    b.record(field_bytes(entries[0]))
+                    for e in entries[1:]:
+                        if isinstance(e, list):
+                            b.list_field([field_bytes(x) for x in e])
+                        else:
+                            b.field(field_bytes(e))
+                    self.assertEqual(b.bytes.hex(), c["bytes"])
+                    self.assertTrue(c0.canonical(b.bytes))
+
+
 class Canonical(unittest.TestCase):
     def test_canonical(self):
         for c in cases("canonical.json"):
