@@ -163,6 +163,35 @@ static PyObject *py_record_fields(PyObject *self, PyObject *args) {
     return out;
 }
 
+static PyObject *py_field_items(PyObject *self, PyObject *args) {
+    Py_buffer v;
+    Py_ssize_t start, end;
+    const uint8_t *base;
+    c0_bytes field, item;
+    c0_list_iter li;
+    PyObject *out;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "y*nn", &v, &start, &end)) return NULL;
+    base = (const uint8_t *)v.buf;
+    field.ptr = base + start;
+    field.len = (size_t)(end - start);
+    out = PyList_New(0);
+    if (!out) {
+        PyBuffer_Release(&v);
+        return NULL;
+    }
+    li = c0_field_items(field);
+    while (c0_next_item(&li, &item)) {
+        if (append_span(out, base, item) != 0) {
+            Py_DECREF(out);
+            PyBuffer_Release(&v);
+            return NULL;
+        }
+    }
+    PyBuffer_Release(&v);
+    return out;
+}
+
 static PyObject *py_document(PyObject *self, PyObject *args) {
     Py_buffer v;
     const uint8_t *base;
@@ -267,6 +296,7 @@ static PyMethodDef c0_methods[] = {
     {"tokenize", py_tokenize, METH_VARARGS, "List of (type, start, end) tokens; raises ValueError on bad input."},
     {"table", py_table, METH_VARARGS, "(name_start, name_end, [header spans], [record spans])."},
     {"record_fields", py_record_fields, METH_VARARGS, "Field spans within a record [start, end)."},
+    {"field_items", py_field_items, METH_VARARGS, "Item spans of a list field [start, end); a plain field is one item."},
     {"document", py_document, METH_VARARGS, "(name_start, name_end, [group spans])."},
     {"stream", py_stream, METH_VARARGS, "(committed_end, torn, [block spans])."},
     {"pretty_format", py_pretty_format, METH_VARARGS, "Format compact bytes as a pretty string."},

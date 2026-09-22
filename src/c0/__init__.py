@@ -15,7 +15,7 @@ b'Alice'
 from __future__ import annotations
 
 from enum import IntEnum
-from typing import Iterator, Optional, Sequence, Union
+from typing import Callable, Iterator, Optional, Sequence, Union
 
 from . import _c0
 
@@ -107,6 +107,16 @@ class Record:
     def value(self, i: int) -> bytes:
         """Field i with DLE escapes decoded."""
         return unescape(self.field(i))
+
+    def list(self, i: int) -> list[bytes]:
+        """Field i as a list of unescaped items (see ``Builder.list_field``).
+
+        A plain (non-scope) field comes back as a one-item list; an empty
+        ``STX ETX`` scope comes back as ``[]``.
+        """
+        s, e = self._spans()[i]
+        mv = memoryview(self._buf)
+        return [unescape(mv[a:b]) for a, b in _c0.field_items(self._buf, s, e)]
 
     @property
     def values(self) -> list[bytes]:
@@ -270,8 +280,10 @@ def _as_bytes(s: Str) -> bytes:
 class Builder:
     """Builds C0DATA compact bytes. Byte-identical to the C builder.
 
-    Names (file/group/header) reject control bytes; record field values are
-    byte-transparent and DLE-escaped automatically.
+    Names (file/group/header/section/ref) and ETB payloads reject control
+    bytes; values (record fields, list items, blocks, items) are
+    byte-transparent and DLE-escaped automatically. Every method returns the
+    builder, so calls chain.
     """
 
     def __init__(self):
@@ -323,8 +335,76 @@ class Builder:
         self._buf.append(EOT)
         return self
 
-    def etb(self) -> "Builder":
+    def etb(self, payload: Optional[Str] = None) -> "Builder":
+        """Write an ETB commit marker (stream mode) with an optional integrity
+        payload, which may not contain control bytes."""
         self._buf.append(ETB)
+        if payload is not None:
+            b = _as_bytes(payload)
+            if any(byte < 0x20 for byte in b):
+                raise ValueError("ETB payload may not contain control bytes")
+            self._buf += b
+        return self
+
+    def nested(self, fn: Callable[["Builder"], object]) -> "Builder":
+        """Write a nested sub-structure: STX, whatever ``fn(builder)`` emits, ETX."""
+        self._buf.append(STX)
+        fn(self)
+        self._buf.append(ETX)
+        return self
+
+    def ref(self, *path: Str) -> "Builder":
+        """Write a reference: ENQ + name, or for two or more segments a path
+        reference ENQ STX segments-joined-by-US ETX."""
+        if not path:
+            raise TypeError("ref() requires at least one segment")
+        self._buf.append(ENQ)
+        if len(path) == 1:
+            self._name(path[0])
+        else:
+            self._buf.append(STX)
+            for i, seg in enumerate(path):
+                if i:
+                    self._buf.append(US)
+                self._name(seg)
+            self._buf.append(ETX)
+        return self
+
+    def list_field(self, items: Sequence[Str]) -> "Builder":
+        """Write a field whose value is a flat list: US STX items-joined-by-US ETX,
+        each item DLE-escaped. Read back with ``Record.list``."""
+        self._buf.append(US)
+        self._buf.append(STX)
+        for i, item in enumerate(items):
+            if i:
+                self._buf.append(US)
+            self._escaped(item)
+        self._buf.append(ETX)
+        return self
+
+    def field(self, value: Str) -> "Builder":
+        """Write a single field (US + escaped value), for building records
+        field by field."""
+        self._buf.append(US)
+        self._escaped(value)
+        return self
+
+    def section(self, name: Str, depth: int = 1) -> "Builder":
+        """Write a document-mode section: GS repeated ``depth`` times + name."""
+        self._buf += bytes([GS]) * depth
+        self._name(name)
+        return self
+
+    def block(self, text: Str) -> "Builder":
+        """Write a document-mode content block: RS + escaped text."""
+        self._buf.append(RS)
+        self._escaped(text)
+        return self
+
+    def item(self, text: Str) -> "Builder":
+        """Write a document-mode list item: US + escaped text."""
+        self._buf.append(US)
+        self._escaped(text)
         return self
 
     @property
