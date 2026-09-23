@@ -36,6 +36,25 @@ log = c0.StreamReader(open("claims.c0", "rb").read())   # .torn, .committed, blo
 print(c0.pretty_format(buf))                            # Unicode Control Pictures
 ```
 
+### List fields
+
+A field whose value is a flat list is written as US-separated items inside
+STX/ETX (`␂Admin␟Editor␃`). `list_field` writes one; `Record.list` reads it
+back as unescaped items.
+
+```python
+buf = c0.build(lambda b: (
+    b.group("users"),
+    b.record("Alice"),
+    b.list_field(["Admin", "Editor"]),   # one field: ␂Admin␟Editor␃
+))
+rec = c0.Table(buf).record(0)
+rec.list(1)                              # [b"Admin", b"Editor"]
+```
+
+The builder also has `field`, `nested`, `ref`, `section`, `block`, `item`,
+and `etb(payload)`, matching the Crystal reference.
+
 ## Install / build
 
 The C core and the shared conformance vectors are git submodules:
