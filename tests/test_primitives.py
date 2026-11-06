@@ -34,6 +34,10 @@ class Primitives(unittest.TestCase):
                           "␝␝sub␞␅users␟␅␂users␟1␃")
         self.assertSpells(build(lambda b: b.syn().soh("version").us("1").rs("a").eot()),
                           "␖␁version␟1␞a␄")
+        # C0-DIFF only: a replace-all, then a pattern with one substitution
+        self.assertSpells(build(lambda b: b.fs("f").rs("old").sub("new").gs("x").us("10").sub("20")),
+                          "␜f␞old␚new␝x␟10␚20")
+        self.assertSpells(build(lambda b: b.rs("old").sub()), "␞old␚")
         self.assertSpells(build(lambda b: b.rs("a").etb("c1").rs("b").etb()), "␞a␗c1␞b␗")
         self.assertEqual(build(lambda b: b.rs("a").em(b"\xff\x00tail")), b"\x1ea\x19\xff\x00tail")
 
@@ -108,7 +112,7 @@ class Primitives(unittest.TestCase):
     def test_everything_returns_the_builder(self):
         b = c0.Builder()
         for r in (b.syn(), b.soh("k"), b.us("v"), b.fs("f"), b.gs(), b.gs("g"), b.rs(), b.us(),
-                  b.rs("a"), b.dle(), b.can(), b.bel(), b.rs("x"), b.bel("n"), b.rs("y"), b.us(),
+                  b.rs("a"), b.dle(), b.can(), b.bel(), b.rs("x"), b.sub(), b.sub("n"), b.bel("n"), b.rs("y"), b.us(),
                   b.enq("g"), b.eot(), b.etb(), b.etb("p"), b.em(b"")):
             self.assertIs(r, b)
         b.close()

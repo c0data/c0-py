@@ -876,6 +876,7 @@ BUILDER_NOARGS_METHOD(eot, c0_builder_eot)
 BUILDER_OPT_BYTES_METHOD(gs, c0_builder_gs, c0_builder_gs_name)
 BUILDER_OPT_BYTES_METHOD(rs, c0_builder_rs, c0_builder_rs_value)
 BUILDER_OPT_BYTES_METHOD(us, c0_builder_us, c0_builder_us_value)
+BUILDER_OPT_BYTES_METHOD(sub, c0_builder_sub, c0_builder_sub_value)
 BUILDER_OPT_BYTES_METHOD(soh, c0_builder_soh, c0_builder_soh_name)
 BUILDER_OPT_BYTES_METHOD(bel, c0_builder_bel, c0_builder_bel_text)
 BUILDER_OPT_BYTES_METHOD(etb, c0_builder_etb, c0_builder_etb_payload)
@@ -1029,6 +1030,7 @@ static PyMethodDef Builder_methods[] = {
     {"gs", (PyCFunction)Builder_gs, METH_VARARGS, "GS and an optional group name; gs(), gs(name) is depth 2."},
     {"rs", (PyCFunction)Builder_rs, METH_VARARGS, "RS and an optional first value: opens a record."},
     {"us", (PyCFunction)Builder_us, METH_VARARGS, "US and an optional value."},
+    {"sub", (PyCFunction)Builder_sub, METH_VARARGS, "SUB and an optional value: the new side of a substitution. C0-DIFF only."},
     {"soh", (PyCFunction)Builder_soh, METH_VARARGS, "SOH and an optional key; bare before rs() it opens a header row."},
     {"dle", (PyCFunction)Builder_dle, METH_NOARGS, "DLE: open a level (saves the record state)."},
     {"can", (PyCFunction)Builder_can, METH_NOARGS, "CAN: close the innermost level; BuildError if none is open."},

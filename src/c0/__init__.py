@@ -940,8 +940,8 @@ class Builder:
     """Writes C0DATA in canonical compact form over the C builder.
 
     Two layers. The primitives are one method per code (``fs``, ``gs``,
-    ``rs``, ``us``, ``soh``, ``dle``, ``can``, ``bel``, ``enq``, ``syn``,
-    ``eot``, ``etb``, ``em``); each writes its code and, when given, what
+    ``rs``, ``us``, ``sub`` (C0-DIFF only), ``soh``, ``dle``, ``can``,
+    ``bel``, ``enq``, ``syn``, ``eot``, ``etb``, ``em``); each writes its code and, when given, what
     grammatically follows it, so a chain reads like the bytes::
 
         b.rs("Alice").us("1502.30")                        # ␞Alice␟1502.30
@@ -999,6 +999,16 @@ class Builder:
             self._b.us()
         else:
             self._b.us(_b(value))
+        return self
+
+    def sub(self, value: Optional[Str] = None) -> "Builder":
+        """SUB and, when given, the new side of a substitution. C0-DIFF only:
+        ``rs("old").sub("new")`` is a replace-all; in a data body SUB is an
+        error. Does not change the unit count."""
+        if value is None:
+            self._b.sub()
+        else:
+            self._b.sub(_b(value))
         return self
 
     def soh(self, name: Optional[Str] = None) -> "Builder":
