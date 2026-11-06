@@ -939,6 +939,21 @@ def _pairs(pairs, kw: dict) -> list:
 class Builder:
     """Writes C0DATA in canonical compact form over the C builder.
 
+    Two layers. The primitives are one method per code (``fs``, ``gs``,
+    ``rs``, ``us``, ``soh``, ``dle``, ``can``, ``bel``, ``enq``, ``syn``,
+    ``eot``, ``etb``, ``em``); each writes its code and, when given, what
+    grammatically follows it, so a chain reads like the bytes::
+
+        b.rs("Alice").us("1502.30")                        # ␞Alice␟1502.30
+        b.rs().soh("host").us("localhost").soh("port").us("5432")
+        b.bel().gs("old")                                  # a dead group
+
+    The composed methods (``file``, ``group``, ``header``, ``record``,
+    ``field``, ``map``, ``key``, ``level``, ``list``, ``ref``, ``note``) are
+    built on the primitives and cannot write ill-formed output. The
+    primitives write what you spell; well-formedness is then yours to keep.
+    Both layers share the record state, so they mix.
+
     Values are byte-transparent and written in their one spelling: plain when
     they can be, text otherwise with only the seven codes escaped. Names
     (file, group, header, key, reference segment, ETB payload) must be plain
@@ -953,17 +968,87 @@ class Builder:
     def __init__(self):
         self._b = _c0.Builder()
 
-    # ---- documents
+    # ---- primitives: one method per code
+
+    def fs(self, name: Str) -> "Builder":
+        """FS and a file name. Ends any open record."""
+        self._b.fs(_b(name))
+        return self
+
+    def gs(self, name: Optional[Str] = None) -> "Builder":
+        """GS and, when given, a group name: ``gs().gs("sub")`` is a group at
+        depth 2. Ends any open record."""
+        if name is None:
+            self._b.gs()
+        else:
+            self._b.gs(_b(name))
+        return self
+
+    def rs(self, value: Optional[Str] = None) -> "Builder":
+        """RS and, when given, the record's first value."""
+        if value is None:
+            self._b.rs()
+        else:
+            self._b.rs(_b(value))
+        return self
+
+    def us(self, value: Optional[Str] = None) -> "Builder":
+        """US and, when given, the value that follows it. Bare: an empty
+        unit, or the separator before ``dle()`` / ``enq()``."""
+        if value is None:
+            self._b.us()
+        else:
+            self._b.us(_b(value))
+        return self
+
+    def soh(self, name: Optional[Str] = None) -> "Builder":
+        """SOH and, when given, a key. Bare before ``rs()`` it opens a header row."""
+        if name is None:
+            self._b.soh()
+        else:
+            self._b.soh(_b(name))
+        return self
+
+    def dle(self) -> "Builder":
+        """DLE: open a nested level. Inside, the builder is at the top of a fresh body."""
+        self._b.dle()
+        return self
+
+    def can(self) -> "Builder":
+        """CAN: close the innermost level. ``BuildError`` if none is open."""
+        self._b.can()
+        return self
+
+    def bel(self, text: Optional[Str] = None) -> "Builder":
+        """BEL and, when given, a note. Bare, it marks the element that
+        follows dead. An empty note is a ``BuildError``."""
+        if text is None:
+            self._b.bel()
+        else:
+            self._b.bel(_b(text))
+        return self
+
+    def enq(self, *path: Str) -> "Builder":
+        """ENQ and a reference: a group name (``␅name``), or a path of two or
+        three names (``␅␂a␟b␟c␃``)."""
+        segs = _fields(path)
+        if not segs:
+            raise TypeError("enq() requires at least one segment")
+        self._b.enq(segs)
+        return self
 
     def syn(self, pairs=None, **kw) -> "Builder":
-        """SYN and a heading: keys in the order given (a mapping, an iterable
-        of pairs, or keyword arguments)."""
+        """SYN, then a heading when given: keys in the order given (a mapping,
+        an iterable of pairs, or keyword arguments). Bare ``syn()`` writes the
+        code alone; heading pairs then follow as ``soh(key).us(value)``."""
         self._b.syn()
         for k, v in _pairs(pairs, kw):
-            self._b.key(k, v)
+            self._b.soh(k)
+            self._b.us(v)
         return self
 
     def eot(self) -> "Builder":
+        """EOT. Ends any open record."""
         self._b.eot()
         return self
 
@@ -980,23 +1065,28 @@ class Builder:
         self._b.em(tail)
         return self
 
+    # ---- composed: built on the primitives, cannot write ill-formed output
+
     # ---- structure
 
     def file(self, name: Str) -> "Builder":
-        self._b.file(_b(name))
-        return self
+        """FS and a file name."""
+        return self.fs(name)
 
     def group(self, name: Str, headers: Optional[Iterable[Str]] = None, depth: int = 1) -> "Builder":
         """GS (repeated ``depth`` times) and a name, then a header row when given."""
-        self._b.section(_b(name), depth)
+        if depth < 1:
+            raise ValueError("depth must be at least 1")
+        for _ in range(depth - 1):
+            self._b.gs()
+        self._b.gs(_b(name))
         if headers is not None:
             self.header(headers)
         return self
 
     def section(self, name: Str, depth: int = 1) -> "Builder":
         """Document mode: a section at depth."""
-        self._b.section(_b(name), depth)
-        return self
+        return self.group(name, None, depth)
 
     def header(self, *names) -> "Builder":
         """A header row: SOH RS name US name ..."""
@@ -1071,16 +1161,15 @@ class Builder:
         segs = _fields(path)
         if not segs:
             raise TypeError("ref() requires at least one segment")
-        if len(segs) == 1:
-            self._b.ref(segs[0])
-        else:
-            self._b.ref_path(segs)
+        self._b.ref_path(segs)
         return self
 
+    # ---- comments
+
     def note(self, text: Str) -> "Builder":
-        """A comment at the current position (BEL and the note)."""
-        self._b.note(_b(text))
-        return self
+        """A comment at the current position: BEL and the note. Content is
+        required; a bare BEL is a dead marker, written with ``bel()``."""
+        return self.bel(text)
 
     # ---- output
 

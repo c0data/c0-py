@@ -839,43 +839,46 @@ static c0_bytes *bytes_array(PyObject *seqobj, PyObject **seq, size_t *count) {
     return arr;
 }
 
-static PyObject *Builder_syn(BuilderObject *self, PyObject *noargs) {
-    (void)noargs;
-    if (!builder_open(self)) return NULL;
-    c0_build_syn(&self->b);
-    return builder_check(self);
-}
+/* ---- primitives: one method per code ---- */
 
-static PyObject *Builder_eot(BuilderObject *self, PyObject *noargs) {
-    (void)noargs;
-    if (!builder_open(self)) return NULL;
-    c0_build_eot(&self->b);
-    return builder_check(self);
-}
-
-static PyObject *Builder_etb(BuilderObject *self, PyObject *args) {
-    Py_buffer p = {0};
-    if (!PyArg_ParseTuple(args, "|y*", &p)) return NULL;
-    if (!builder_open(self)) {
-        if (p.obj) PyBuffer_Release(&p);
-        return NULL;
+/* Methods taking no argument. */
+#define BUILDER_NOARGS_METHOD(pyname, cfunc)                                  \
+    static PyObject *Builder_##pyname(BuilderObject *self, PyObject *noargs) {\
+        (void)noargs;                                                         \
+        if (!builder_open(self)) return NULL;                                 \
+        cfunc(&self->b);                                                      \
+        return builder_check(self);                                           \
     }
-    c0_build_etb(&self->b, p.obj ? (const uint8_t *)p.buf : NULL, p.obj ? (size_t)p.len : 0);
-    if (p.obj) PyBuffer_Release(&p);
-    return builder_check(self);
-}
 
-static PyObject *Builder_em(BuilderObject *self, PyObject *args) {
-    Py_buffer t;
-    if (!PyArg_ParseTuple(args, "y*", &t)) return NULL;
-    if (!builder_open(self)) {
-        PyBuffer_Release(&t);
-        return NULL;
+/* Methods taking one optional bytes argument: the bare code, or the code and
+ * what follows it. */
+#define BUILDER_OPT_BYTES_METHOD(pyname, bare, withval)                       \
+    static PyObject *Builder_##pyname(BuilderObject *self, PyObject *args) {  \
+        Py_buffer v = {0};                                                    \
+        if (!PyArg_ParseTuple(args, "|y*", &v)) return NULL;                  \
+        if (!builder_open(self)) {                                            \
+            if (v.obj) PyBuffer_Release(&v);                                  \
+            return NULL;                                                      \
+        }                                                                     \
+        if (v.obj) {                                                          \
+            withval(&self->b, (const uint8_t *)v.buf, (size_t)v.len);         \
+            PyBuffer_Release(&v);                                             \
+        } else {                                                              \
+            bare(&self->b);                                                   \
+        }                                                                     \
+        return builder_check(self);                                           \
     }
-    c0_build_em(&self->b, (const uint8_t *)t.buf, (size_t)t.len);
-    PyBuffer_Release(&t);
-    return builder_check(self);
-}
+
+BUILDER_NOARGS_METHOD(dle, c0_builder_dle)
+BUILDER_NOARGS_METHOD(can, c0_builder_can)
+BUILDER_NOARGS_METHOD(syn, c0_builder_syn)
+BUILDER_NOARGS_METHOD(eot, c0_builder_eot)
+BUILDER_OPT_BYTES_METHOD(gs, c0_builder_gs, c0_builder_gs_name)
+BUILDER_OPT_BYTES_METHOD(rs, c0_builder_rs, c0_builder_rs_value)
+BUILDER_OPT_BYTES_METHOD(us, c0_builder_us, c0_builder_us_value)
+BUILDER_OPT_BYTES_METHOD(soh, c0_builder_soh, c0_builder_soh_name)
+BUILDER_OPT_BYTES_METHOD(bel, c0_builder_bel, c0_builder_bel_text)
+BUILDER_OPT_BYTES_METHOD(etb, c0_builder_etb, c0_builder_etb_payload)
 
 /* Methods taking one bytes argument. */
 #define BUILDER_BYTES_METHOD(pyname, cfunc)                                   \
@@ -891,6 +894,8 @@ static PyObject *Builder_em(BuilderObject *self, PyObject *args) {
         return builder_check(self);                                           \
     }
 
+BUILDER_BYTES_METHOD(fs, c0_builder_fs)
+BUILDER_BYTES_METHOD(em, c0_builder_em)
 BUILDER_BYTES_METHOD(file, c0_build_file)
 BUILDER_BYTES_METHOD(group, c0_build_group)
 BUILDER_BYTES_METHOD(field, c0_build_field)
@@ -930,6 +935,7 @@ static PyObject *Builder_section(BuilderObject *self, PyObject *args) {
         return builder_check(self);                                           \
     }
 
+BUILDER_SEQ_METHOD(enq, c0_builder_enq_path)
 BUILDER_SEQ_METHOD(header, c0_build_header)
 BUILDER_SEQ_METHOD(record, c0_build_record)
 BUILDER_SEQ_METHOD(list, c0_build_list)
@@ -1018,10 +1024,21 @@ static PyObject *Builder_close(BuilderObject *self, PyObject *noargs) {
 }
 
 static PyMethodDef Builder_methods[] = {
-    {"syn", (PyCFunction)Builder_syn, METH_NOARGS, "SYN; keyed units until the next element are the heading."},
+    /* primitives: one per code; the bare form writes the code alone */
+    {"fs", (PyCFunction)Builder_fs, METH_VARARGS, "FS name; ends any open record."},
+    {"gs", (PyCFunction)Builder_gs, METH_VARARGS, "GS and an optional group name; gs(), gs(name) is depth 2."},
+    {"rs", (PyCFunction)Builder_rs, METH_VARARGS, "RS and an optional first value: opens a record."},
+    {"us", (PyCFunction)Builder_us, METH_VARARGS, "US and an optional value."},
+    {"soh", (PyCFunction)Builder_soh, METH_VARARGS, "SOH and an optional key; bare before rs() it opens a header row."},
+    {"dle", (PyCFunction)Builder_dle, METH_NOARGS, "DLE: open a level (saves the record state)."},
+    {"can", (PyCFunction)Builder_can, METH_NOARGS, "CAN: close the innermost level; BuildError if none is open."},
+    {"bel", (PyCFunction)Builder_bel, METH_VARARGS, "BEL and an optional note; bare, the element that follows is dead."},
+    {"enq", (PyCFunction)Builder_enq, METH_VARARGS, "ENQ and a reference: a sequence of one to three names."},
+    {"syn", (PyCFunction)Builder_syn, METH_NOARGS, "SYN; soh(key), us(value) pairs that follow are the heading."},
     {"eot", (PyCFunction)Builder_eot, METH_NOARGS, "EOT."},
     {"etb", (PyCFunction)Builder_etb, METH_VARARGS, "ETB and an optional plain payload."},
-    {"em", (PyCFunction)Builder_em, METH_VARARGS, "EM and the raw tail."},
+    {"em", (PyCFunction)Builder_em, METH_VARARGS, "EM and the raw tail; nothing may follow."},
+    /* composed: built on the primitives, cannot write ill-formed output */
     {"file", (PyCFunction)Builder_file, METH_VARARGS, "FS name."},
     {"group", (PyCFunction)Builder_group, METH_VARARGS, "GS name."},
     {"section", (PyCFunction)Builder_section, METH_VARARGS, "GS x depth, name."},

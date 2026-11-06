@@ -82,6 +82,32 @@ The builder also has `file`, `section`, `header`, `field`, `key`, `note`,
 `etb(payload)`, `em(tail)`, `block` and `item`, matching the Crystal reference.
 Every error derives from `c0.C0Error`.
 
+### Primitives
+
+Underneath, the builder has one method per code: `fs`, `gs`, `rs`, `us`,
+`soh`, `dle`, `can`, `bel`, `enq`, `syn`, `eot`, `etb`, `em`. Each writes
+its code and, when given, what follows it, so a chain reads like the bytes,
+and anything the grammar allows can be written. The argument is optional
+where the grammar allows the code alone (`gs()`, `rs()`, `us()`, `soh()`,
+`bel()`, `etb()`); `enq` takes one to three names:
+
+```python
+b.rs("Alice").us("1502.30")                                 # ␞Alice␟1502.30
+b.rs().soh("host").us("localhost").soh("port").us("5432")   # ␞␁host␟localhost␁port␟5432
+b.gs("users").soh().rs("name").us("amount")                 # ␝users␁␞name␟amount: a header row
+b.rs("cfg").us().dle().rs().soh("b").us("2").can()          # ␞cfg␟␐␞␁b␟2␘
+b.bel("checked").rs("x")                                    # ␇checked␞x: a note
+b.bel().gs("old")                                           # ␇␝old: a dead group
+b.gs().gs("sub").rs().enq("users").us().enq("users", "1")   # ␝␝sub␞␅users␟␅␂users␟1␃
+b.syn().soh("version").us("1").rs("a").eot()                # ␖␁version␟1␞a␄
+```
+
+The composed methods above are built on these and cannot write ill-formed
+output; with the primitives, well-formedness is yours. Values keep their one
+spelling either way (there is no STX/ETX primitive), and names are still
+checked. The two layers share the record state and mix freely:
+`b.rs("a").field("b")` writes `␞a␟b`, `b.record().us("c")` writes `␞␟c`.
+
 ## Install / build
 
 The C core and the shared conformance vectors are git submodules:
