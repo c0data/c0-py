@@ -30,7 +30,7 @@ from .errors import (
 )
 from . import _c0
 
-__version__ = "1.0.0.dev0"
+__version__ = "0.3.0"
 VERSION = _c0.VERSION
 
 __all__ = [

@@ -299,7 +299,7 @@ class Basic(unittest.TestCase):
         self.assertTrue(c0.is_text_escaped(c0.ETB))
         self.assertFalse(c0.is_text_escaped(c0.RS))
         self.assertEqual(c0.decode_text(b"a\x10\x02b"), b"a\x02b")
-        self.assertEqual(c0.VERSION, "1.0.0-dev")
+        self.assertEqual(c0.VERSION, "0.2.0")
 
 
 if __name__ == "__main__":
