@@ -112,7 +112,11 @@ checked. The two layers share the record state and mix freely:
 
 ## Install / build
 
-The C core and the shared conformance vectors are git submodules:
+```sh
+pip install c0data        # the package is c0data; in code it is `import c0`
+```
+
+From a checkout, the C core and the shared conformance vectors are git submodules:
 
 ```sh
 git submodule update --init        # pulls in c0-c (the header) and c0-spec

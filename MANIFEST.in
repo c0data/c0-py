@@ -1,0 +1,3 @@
+include c0-c/c0.h
+include README.md
+include LICENSE
