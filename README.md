@@ -113,7 +113,7 @@ checked. The two layers share the record state and mix freely:
 ## Install / build
 
 ```sh
-pip install c0data        # the package is c0data; in code it is `import c0`
+pip install c0data-py     # the package is c0data-py (PyPI treats c0data as codata); in code it is `import c0`
 ```
 
 From a checkout, the C core and the shared conformance vectors are git submodules:
