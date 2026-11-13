@@ -1,6 +1,6 @@
 """Runs the shared conformance vectors from the c0-spec submodule (schema v2;
-see c0-spec/vectors/README.md). The harness mirrors c0-cr's
-spec/conformance_spec.cr. diff.json is not run: this port has no C0-DIFF."""
+see c0-spec/vectors/README.md): decode, encode, canonical, invalid, stream,
+nested and diff. The harness mirrors c0-cr's spec/conformance_spec.cr."""
 import json
 import unittest
 from pathlib import Path
@@ -23,10 +23,12 @@ def scalar_bytes(f):
 
 
 def flat_groups(groups, depth=1):
-    """Flatten a group list with "sections" into (depth, group) pairs."""
+    """Flatten a group list with "sections" into (depth, group) pairs. A
+    section with a null name is a skipped depth: no group stands there."""
     out = []
     for g in groups:
-        out.append((depth, g))
+        if g["name"] is not None:
+            out.append((depth, g))
         if "sections" in g:
             out.extend(flat_groups(g["sections"], depth + 1))
     return out
@@ -42,8 +44,13 @@ class Checks(unittest.TestCase):
             self.check_body(rec.level(i), f["level"])
         elif "ref" in f:
             ref = f["ref"]
-            expected = [ref.encode()] if isinstance(ref, str) else [s.encode() for s in ref]
-            self.assertEqual(rec.ref(i).path, expected)
+            r = rec.ref(i)
+            if isinstance(ref, str):
+                self.assertEqual(r.name, ref.encode())
+                self.assertIsNone(r.pattern)
+            else:
+                self.assertIsNone(r.name)
+                self.check_body(r.pattern, ref["level"])
         else:
             raise ValueError("unknown value form %r" % (f,))
 
@@ -99,7 +106,8 @@ class Checks(unittest.TestCase):
     def check_files(self, body, files):
         self.assertEqual(len(body.files), len(files))
         for i, f in enumerate(files):
-            self.assertEqual(body.files[i].name, f["name"].encode())
+            self.assertEqual(body.files[i].name, (f["name"] or "").encode())
+            self.assertEqual(body.files[i].leading, f["name"] is None)
             self.check_groups(body.files[i].groups, f["groups"])
 
     def check_heading(self, h, e):
@@ -123,7 +131,10 @@ def build_value(b, f):
             build_body(b, f["level"])
     elif "ref" in f:
         ref = f["ref"]
-        b.ref(*([ref] if isinstance(ref, str) else ref))
+        if isinstance(ref, str):
+            b.ref(ref)
+        else:
+            b.ref(lambda: build_body(b, ref["level"]))
     elif "map" in f:
         with b.level():
             build_record(b, {"keys": f["map"]})
@@ -148,16 +159,18 @@ def build_record(b, r):
                     build_body(b, v["level"])
 
 
-def build_groups(b, groups):
+def build_groups(b, groups, depth=1):
     for i, g in enumerate(groups):
         headers = g["headers"]
-        if g["name"] == "" and i == 0:
+        if g["name"] == "" and i == 0 and depth == 1:
             if headers is not None:
                 b.header(headers)  # the unnamed leading group: no GS
-        else:
-            b.group(g["name"], headers)
+        elif g["name"] is not None:
+            b.group(g["name"], headers, depth)
         for r in g["records"]:
             build_record(b, r)
+        if "sections" in g:
+            build_groups(b, g["sections"], depth + 1)
 
 
 def build_body(b, e):
@@ -168,6 +181,11 @@ def build_body(b, e):
             build_record(b, r)
     elif "groups" in e:
         build_groups(b, e["groups"])
+    elif "files" in e:
+        for f in e["files"]:
+            if f["name"] is not None:
+                b.fs(f["name"])
+            build_groups(b, f["groups"])
 
 
 # ================================================================== tests
@@ -293,12 +311,25 @@ class Nested(Checks):
                     self.assertTrue(c0.canonical(out))
 
 
+class Diff(unittest.TestCase):
+    def test_diff(self):
+        for c in cases("diff.json"):
+            with self.subTest(c["name"]):
+                diff = bytes.fromhex(c["diff"])
+                files = dict(c["files"])
+                if c.get("error"):
+                    with self.assertRaises(c0.C0Error):
+                        c0.diff.apply(diff, files)
+                else:
+                    self.assertEqual(c0.diff.apply(diff, files), c["result"])
+
+
 class Stream(unittest.TestCase):
     def test_stream(self):
         for c in cases("stream.json"):
             with self.subTest(c["name"]):
                 buf = bytes.fromhex(c["bytes"])
-                r = c0.StreamReader(buf)
+                r = c0.StreamReader(buf, continue_past_damage=True)
                 self.assertEqual(r.committed_end, c["committed_end"])
                 self.assertEqual(r.torn, c["torn"])
                 self.assertEqual(r.block_count, len(c["blocks"]))

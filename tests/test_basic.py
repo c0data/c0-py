@@ -126,23 +126,44 @@ class Basic(unittest.TestCase):
 
     def test_references(self):
         buf = c0.build(lambda b: (b.record("My Post"), b.ref("tags"), b.ref("tags", "001", "label")))
-        self.assertEqual(buf, b"\x1eMy Post\x1f\x05tags\x1f\x05\x02tags\x1f001\x1flabel\x03")
+        # a plain name is a group reference; a record or field reference is a pattern: ␅␐␝tags␞001␟label␘
+        self.assertEqual(buf, b"\x1eMy Post\x1f\x05tags\x1f\x05\x10\x1dtags\x1e001\x1flabel\x18")
         rec = c0.Body(buf).record(0)
+        self.assertEqual(rec.ref(1).name, b"tags")
+        self.assertIsNone(rec.ref(1).pattern)
         self.assertEqual(rec.ref(1).path, [b"tags"])
         self.assertTrue(rec.ref(1).is_group)
         r = rec.ref(2)
-        self.assertEqual((r.group, r.record, r.field), (b"tags", b"001", b"label"))
+        self.assertIsNone(r.name)
+        self.assertEqual(r.pattern.group("tags").record(0).values, [b"001", b"label"])
+        self.assertEqual(r.path, [b"tags", b"001", b"label"])
+        self.assertFalse(r.is_group)
+        with self.assertRaises(c0.UnitTypeError):
+            r.group
         with self.assertRaises(c0.UnitTypeError):
             rec.ref(0)
+        # a pattern that is a bare group line names the group as a whole
+        g = c0.Body(c0.pretty_parse("␞␅␐␝tags␘")).record(0).ref(0)
+        self.assertTrue(g.is_group)
+        self.assertEqual(g.group_name, b"tags")
+        # a pattern built freely: a file, two group depths, a keyed step
+        buf = c0.build(lambda b: (b.record("x"), b.ref(lambda: b.fs("f").gs("a").gs().gs("b").rs().soh("host").us())))
+        self.assertEqual(c0.pretty_format(buf, mode=c0.PrettyMode.COMPACT).count("␅"), 1)
+        self.assertEqual(c0.Body(buf).record(0).ref(1).path, [b"f", b"a", b"b", b"host"])
+        # the text form is an error; so is a value inside a pattern
+        with self.assertRaises(c0.C0SyntaxError):
+            c0.Body(b"\x1e\x05\x02tags\x1f001\x03")
+        with self.assertRaises(c0.C0SyntaxError):
+            c0.Body(c0.pretty_parse("␞␅␐␝a␞␂ b␃␘"))
         with self.assertRaises(c0.BuildError):
             c0.Builder().ref("bad\x1fname")
         with self.assertRaises(c0.BuildError):
-            c0.Builder().ref("a", "", "c")
+            c0.Builder().ref("", "1")
 
     def test_heading_container_and_blob(self):
         raw = b"lamp-bytes"
         buf = c0.build(lambda b: (
-            b.syn(shape="tabular", version="1"),
+            b.syn(schema="ledger", version="1"),
             b.key_level("blob", lambda l: (l.header("name", "offset", "length"),
                                            l.record("lamp", "0", str(len(raw))))),
             b.group("items", ["name"]),
@@ -155,8 +176,9 @@ class Basic(unittest.TestCase):
         doc = cont.first
         self.assertTrue(doc.has_syn and doc.has_eot)
         self.assertEqual(doc.warnings, [])
-        self.assertEqual(doc.heading.keys, [b"shape", b"version", b"blob"])
-        self.assertEqual(doc.shape, "tabular")
+        self.assertEqual(doc.heading.keys, [b"schema", b"version", b"blob"])
+        self.assertIsNone(doc.shape)
+        self.assertEqual(doc.heading.schema, b"ledger")
         self.assertEqual(doc.heading.version, 1)
         self.assertEqual(doc.heading.blob.group(0).headers, [b"name", b"offset", b"length"])
         self.assertTrue(cont.has_em)
@@ -167,10 +189,20 @@ class Basic(unittest.TestCase):
         # EM with no blob table is a loud warning
         self.assertIn("EM with no blob table: the region is unaddressable",
                       c0.Container(b"\x16\x1ea\x04\x19xyz").warnings)
-        # unknown key / shape warnings
+        # unknown key / shape warnings; the shape hints are gone, only diff and stream are known
         d = c0.Document(b"\x16\x01shape\x1fodd\x01color\x1fblue\x1ea\x04")
         self.assertIn("unknown heading key 'color'", d.warnings)
         self.assertIn("unknown shape 'odd'", d.warnings)
+        self.assertIn("unknown shape 'tabular'", c0.Document(b"\x16\x01shape\x1ftabular\x1ea\x04").warnings)
+        self.assertEqual(c0.Document(b"\x16\x01shape\x1fstream\x1ea").warnings, [])
+        # the schema key: a name, or a level holding one keyed record of name / url / hash
+        d = c0.Document(c0.pretty_parse("␖␁schema␟␐␞␁name␟ledger␁hash␟sha256:00␘␞a␄"))
+        self.assertEqual(d.warnings, [])
+        self.assertEqual(d.heading.schema.pairs, [(b"name", b"ledger"), (b"hash", b"sha256:00")])
+        with self.assertRaises(c0.C0SyntaxError):
+            c0.Document(c0.pretty_parse("␖␁schema␟␐␞␁color␟blue␘␞a␄"))
+        with self.assertRaises(c0.C0SyntaxError):
+            c0.Document(c0.pretty_parse("␖␁schema␟␂ledger␃␞a␄"))
         # two documents, the second without SYN, is an error
         with self.assertRaises(c0.C0SyntaxError):
             c0.Container(b"\x16\x1ea\x04\x1eb")
@@ -181,6 +213,24 @@ class Basic(unittest.TestCase):
         self.assertEqual(g.record_count, 1)
         self.assertEqual(g.record(0).values, [b"Alice", b"", b"100"])
         self.assertFalse(c0.canonical(buf))
+        # dead means the element and everything it holds
+        body = c0.Body(c0.pretty_parse("␇␝old␁␞h␞1␝␝deeper␞2␝new␞3"))
+        self.assertEqual([g.name for g in body.groups], [b"new"])
+        body = c0.Body(c0.pretty_parse("␇␜a␝g␞1␜b␞2"))
+        self.assertEqual([f.name for f in body.files], [b"b"])
+        self.assertEqual(c0.Document(c0.pretty_parse("␇␜a␝g␞1␜b␞2")).dead_elements, 1)
+        # a body whose every element is dead is an empty body: one empty leading file
+        body = c0.Body(c0.pretty_parse("␇␜b␞2"))
+        self.assertEqual(len(body.files), 1)
+        self.assertTrue(body.files[0].leading)
+        self.assertEqual((body.name, body.groups), (b"", []))
+        # a header row anywhere but first in its group is an error, live or dead
+        with self.assertRaises(c0.C0SyntaxError):
+            c0.Body(c0.pretty_parse("␝g␞1␁␞h"))
+        with self.assertRaises(c0.C0SyntaxError):
+            c0.Body(c0.pretty_parse("␝g␞1␇␁␞h"))
+        # a header row admits notes
+        self.assertEqual(c0.Body(c0.pretty_parse("␁␞a␇n␟b")).group(0).headers, [b"a", b"b"])
         self.assertEqual(c0.Builder().note("see the runbook").bytes, b"\x07see the runbook")
         with self.assertRaises(c0.BuildError):
             c0.Builder().note("")
@@ -227,11 +277,26 @@ class Basic(unittest.TestCase):
         self.assertEqual([x.strings for x in r], [["create", "a1b2"]])
         self.assertEqual(r.document.shape, "stream")
         self.assertEqual(r.body.group(0).headers, [b"op", b"id"])
-        # a raw ETB inside open text commits a damaged block
+        # a raw ETB inside open text commits a damaged block: by default the reader
+        # delivers the records before it and raises with the offset to resume at
         d = c0.StreamReader(b"\x1e\x02a\x17\x1eb\x17")
         self.assertEqual(d.damaged, [0])
         self.assertTrue(d.is_damaged(0))
-        self.assertEqual([x.strings for x in d.records], [["b"]])
+        self.assertEqual(d.resume_offset, 4)
+        with self.assertRaises(c0.DamagedBlockError) as cm:
+            d.records
+        self.assertEqual((cm.exception.index, cm.exception.resume_offset), (0, 4))
+        self.assertEqual([x.strings for x in c0.StreamReader(d.committed, continue_past_damage=True)], [["b"]])
+        # any error inside a committed block damages that block alone
+        s = c0.StreamReader(c0.pretty_parse("␞a␗␞b␟␇␅tags␗␞c␗"))
+        self.assertEqual((s.damaged, s.resume_offset), ([1], 13))
+        got = []
+        with self.assertRaises(c0.DamagedBlockError):
+            for rec in s:
+                got.append(rec.strings)
+        self.assertEqual(got, [["a"]])
+        self.assertEqual([x.strings for x in c0.StreamReader(s.committed, continue_past_damage=True).records],
+                         [["a"], ["c"]])
 
     def test_builder_parity_bytes(self):
         b = c0.Builder()
@@ -278,9 +343,12 @@ class Basic(unittest.TestCase):
 
     def test_pretty_roundtrip(self):
         buf = c0.build(lambda b: (
-            b.syn(shape="tabular"),
+            b.syn(schema="ledger"),
             b.group("g", ["a", "b"]), b.record("x", "y\x1fz"),
             b.record("n"), b.level(lambda l: l.record("1", "2")),
+            b.record("old"), b.sub(), b.record("new"),
+            b.record("a"), b.supersede("b", "c"), b.ref("g", "x"),
+            b.sub(), b.group("h"), b.record("1"),
             b.eot(),
         ))
         pretty = c0.pretty_format(buf)

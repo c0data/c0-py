@@ -23,6 +23,8 @@ from .errors import (
     BuildError,
     C0Error,
     C0SyntaxError,
+    DamagedBlockError,
+    DiffError,
     NotFoundError,
     UnassignedCodeError,
     UnexpectedEndError,
@@ -37,12 +39,13 @@ __all__ = [
     "SOH", "STX", "ETX", "EOT", "ENQ", "BEL", "DLE", "SYN", "ETB", "CAN", "EM", "SUB",
     "FS", "GS", "RS", "US", "HT", "LF", "CR", "SP",
     "C0Error", "C0SyntaxError", "UnassignedCodeError", "UnexpectedEndError",
-    "UnitTypeError", "NotFoundError", "BuildError",
+    "UnitTypeError", "NotFoundError", "BuildError", "DiffError", "DamagedBlockError",
     "UnitType", "PrettyMode",
     "is_assigned", "is_layout", "is_text_escaped", "is_plain", "is_name",
     "decode_text", "validate", "canonical", "pretty_format", "pretty_parse",
-    "Record", "Group", "Table", "FileView", "Body", "Reference",
+    "Unit", "Record", "Group", "Table", "FileView", "Body", "Reference",
     "Heading", "Document", "Container", "StreamReader", "Builder", "build",
+    "diff", "parse_diff", "apply_diff", "DiffBuilder", "PatternBuilder",
 ]
 
 # Assigned control codes (DESIGN.md "Assigned Control Codes").
@@ -122,13 +125,17 @@ def decode_text(inside: Bytes) -> bytes:
 
 def validate(buf: Bytes) -> None:
     """Check a whole buffer against the grammar. Raises a ``C0SyntaxError``
-    (or a subclass) on the first error; returns None when well-formed."""
+    (or a subclass) on the first error; returns None when well-formed.
+    Constructing a ``Body``, ``Document`` or ``Container`` applies the same
+    check: parse is validate."""
     _c0.validate(buf)
 
 
 def canonical(buf: Bytes) -> bool:
-    """Whether bytes are a canonical unit: well-formed, no layout, one
-    spelling per value, unique keys per keyed record, no framing, no comments."""
+    """Whether bytes are a canonical span: well-formed, no layout, one
+    spelling per value, unique keys per keyed record, no framing, no notes
+    or dead elements. Supersession is content and is kept. Opt-in: a
+    canonical violation never fails parsing."""
     return _c0.canonical(buf)
 
 
@@ -149,40 +156,131 @@ def pretty_parse(text: str) -> bytes:
 # ---- records -----------------------------------------------------------------
 
 class Reference:
-    """A parsed reference: a group name, or a path of two or three segments
-    (group, record id, field name)."""
+    """A parsed reference (DESIGN.md "References"): a group ``name`` written
+    plain (``␅tags``), or a ``pattern``, the level ``␅␐…␘`` that is one
+    branch of the target with its values left out, reported as the ``Body``
+    it is written as (``␅␐␝tags␞001␟label␘``). Form checked, not resolved."""
 
-    __slots__ = ("path",)
+    __slots__ = ("name", "pattern")
 
-    def __init__(self, path: Sequence[bytes]):
-        self.path = list(path)
-
-    @property
-    def group(self) -> bytes:
-        return self.path[0]
-
-    @property
-    def record(self) -> Optional[bytes]:
-        return self.path[1] if len(self.path) > 1 else None
+    def __init__(self, name: Optional[bytes], pattern: Optional["Body"]):
+        self.name = name
+        self.pattern = pattern
 
     @property
-    def field(self) -> Optional[bytes]:
-        return self.path[2] if len(self.path) > 2 else None
+    def is_pattern(self) -> bool:
+        return self.pattern is not None
 
     @property
     def is_group(self) -> bool:
-        return len(self.path) == 1
+        """Whether the reference names a group as a whole: a plain name, or
+        a pattern that is a bare group line."""
+        if self.name is not None:
+            return True
+        p = self.pattern
+        files = p.files
+        if len(files) != 1 or not files[0].leading:
+            return False
+        groups = files[0].groups
+        return len(groups) == 1 and groups[0].depth > 0 and not groups[0].records
+
+    @property
+    def group_name(self) -> Optional[bytes]:
+        """The group named, when the reference names a group as a whole."""
+        if self.name is not None:
+            return self.name
+        return self.pattern.groups[0].name if self.is_group else None
+
+    @property
+    def group(self) -> bytes:
+        """The group of a group reference; ``UnitTypeError`` for a pattern
+        that walks into a group."""
+        g = self.group_name
+        if g is None:
+            raise UnitTypeError("reference is a pattern, not a group")
+        return g
+
+    @property
+    def path(self) -> list:
+        """The steps of the pattern in walking order (file, group names,
+        record id, field name, then the inner pattern's steps; a keyed step
+        contributes its key), or the group name alone. Informal."""
+        if self.name is not None:
+            return [self.name]
+        out: list = []
+        files = self.pattern.files
+        if not files:
+            return out
+        f = files[0]
+        if not f.leading:
+            out.append(f.name)
+        groups = f.groups
+        for g in groups:
+            if g.depth != 0:
+                out.append(g.name)
+        if groups and groups[-1].records:
+            rec = groups[-1].records[0]
+            if rec.keyed:
+                keys = rec.keys
+                if keys:
+                    out.append(keys[0])
+            else:
+                for i in range(rec.field_count):
+                    if i < 2:
+                        out.append(rec.value(i))
+                    elif rec.unit_type(i) == UnitType.LEVEL:
+                        out.extend(Reference(None, rec.level(i)).path)
+        return out
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, Reference) and other.path == self.path
+        if not isinstance(other, Reference):
+            return False
+        if self.name is not None or other.name is not None:
+            return self.name == other.name
+        return bytes(self.pattern.raw) == bytes(other.pattern.raw)
 
     def __repr__(self) -> str:
-        return f"Reference({self.path!r})"
+        if self.name is not None:
+            return f"Reference(name={self.name!r})"
+        return f"Reference(pattern={bytes(self.pattern.raw)!r})"
+
+
+class Unit:
+    """One positional unit of a record as written: its raw bytes and whether
+    the unit after it supersedes it (``old␚␟new``)."""
+
+    __slots__ = ("_buf", "_start", "_end", "superseded")
+
+    def __init__(self, buf: Bytes, start: int, end: int, superseded: bool):
+        self._buf = buf
+        self._start = start
+        self._end = end
+        self.superseded = superseded
+
+    @property
+    def raw(self) -> memoryview:
+        return _mv(self._buf)[self._start:self._end]
+
+    @property
+    def unit_type(self) -> "UnitType":
+        return UnitType(_c0.unit_type(self._buf, self._start, self._end))
+
+    @property
+    def value(self) -> bytes:
+        """Logical value; ``UnitTypeError`` for a level or a reference."""
+        return _c0.value(self._buf, self._start, self._end)
+
+    def __repr__(self) -> str:
+        return f"Unit({bytes(self.raw)!r}, superseded={self.superseded})"
 
 
 class Record:
     """A record: positional (units separated by US) or keyed (SOH key US
     value ...), never mixed. Zero-copy accessors over the buffer.
+
+    The positional and keyed accessors report the record's **result**: a
+    superseded unit (``old␚␟new``) and a dead one are not among them;
+    ``units`` lists every positional unit as written.
 
     Positional access takes an index; keyed access takes a key (``str`` or
     ``bytes``). ``value``, ``string``, ``level``, ``list`` and ``ref`` accept
@@ -225,7 +323,7 @@ class Record:
 
     @property
     def field_count(self) -> int:
-        """Number of positional units (0 for a keyed record)."""
+        """Number of positional units of the result (0 for a keyed record)."""
         return len(self._spans())
 
     @property
@@ -233,6 +331,13 @@ class Record:
         """Raw units with their layout, as memoryviews."""
         mv = _mv(self._buf)
         return [mv[s:e] for s, e in self._spans()]
+
+    @property
+    def units(self) -> list:
+        """Every positional unit as written, superseded ones included, each
+        a ``Unit`` with its ``superseded`` flag."""
+        return [Unit(self._buf, s, e, sup)
+                for s, e, sup in _c0.record_written_units(self._buf, self._start, self._end)]
 
     def field(self, i: int) -> memoryview:
         """Raw unit ``i`` (layout at its edges included)."""
@@ -267,7 +372,7 @@ class Record:
         """Unit ``i`` as a nested level: the body between its DLE and CAN."""
         s, e = self._locate(i)
         bs, be = _c0.unit_level(self._buf, s, e)
-        return Body(self._buf, bs, be)
+        return Body(self._buf, bs, be, _valid=True)
 
     def list(self, i: Union[int, Str]) -> list:
         """Unit ``i`` as a flat list: a level holding at most one positional
@@ -277,11 +382,13 @@ class Record:
         return [_c0.value(self._buf, a, b) for a, b in _c0.unit_list(self._buf, s, e)]
 
     def ref(self, i: Union[int, Str]) -> Reference:
-        """Unit ``i`` as a reference (form checked, not resolved)."""
+        """Unit ``i`` as a reference (form checked, not resolved): a group
+        name, or a pattern as a ``Body``."""
         s, e = self._locate(i)
-        mv = _mv(self._buf)
-        segs = _c0.unit_ref(self._buf, s, e)
-        return Reference([bytes(mv[a:b]) for a, b in segs])
+        is_pattern, a, b = _c0.unit_ref(self._buf, s, e)
+        if is_pattern:
+            return Reference(None, Body(self._buf, a, b, _valid=True))
+        return Reference(bytes(_mv(self._buf)[a:b]), None)
 
     # ---- keyed
 
@@ -456,16 +563,18 @@ Table = Group
 
 
 class FileView:
-    """A file within a body: its name and groups."""
+    """A file within a body: its name and groups. The unnamed file before
+    the first FS is ``leading``."""
 
-    __slots__ = ("_buf", "_ns", "_ne", "_start", "_stop", "_groups")
+    __slots__ = ("_buf", "_ns", "_ne", "_start", "_stop", "leading", "_groups")
 
-    def __init__(self, buf: Bytes, ns: int, ne: int, start: int, stop: int):
+    def __init__(self, buf: Bytes, ns: int, ne: int, start: int, stop: int, leading: bool = False):
         self._buf = buf
         self._ns = ns
         self._ne = ne
         self._start = start
         self._stop = stop
+        self.leading = leading
         self._groups = None
 
     @property
@@ -480,7 +589,8 @@ class FileView:
     def groups(self) -> list:
         if self._groups is None:
             self._groups = [Group(self._buf, *g)
-                            for g in _c0.file_groups(self._buf, self._ns, self._ne, self._start, self._stop)]
+                            for g in _c0.file_groups(self._buf, self._ns, self._ne, self._start, self._stop,
+                                                     self.leading)]
         return self._groups
 
     def group(self, which: Union[int, Str]) -> Group:
@@ -506,15 +616,21 @@ class Body:
     """Zero-copy navigator for a document body (the bytes between a heading
     and EOT) or the inside of a nested level. Records before the first GS of
     a file form an unnamed group; records and groups before the first FS form
-    an unnamed file."""
+    an unnamed (leading) file.
+
+    ``Body(buf)`` parses the slice: the whole grammar is applied and a
+    ``C0SyntaxError`` raised on malformed input (parse is validate). The
+    model is the **result**: dead and superseded elements are not in it."""
 
     __slots__ = ("_buf", "start", "stop", "_files")
 
-    def __init__(self, buf: Bytes, start: int = 0, stop: Optional[int] = None):
+    def __init__(self, buf: Bytes, start: int = 0, stop: Optional[int] = None, *, _valid: bool = False):
         self._buf = buf
         self.start = start
         self.stop = len(_mv(buf)) if stop is None else stop
         self._files = None
+        if not _valid:
+            _c0.body_read(buf, self.start, self.stop)
 
     @property
     def raw(self) -> memoryview:
@@ -582,13 +698,14 @@ class Body:
 # ---- documents ---------------------------------------------------------------
 
 class Heading:
-    """The heading of a document: keyed units after SYN, in written order.
-    Lookups take the last value for a duplicate key."""
+    """The heading of a document: keyed units after SYN, in written order,
+    dead and superseded units dropped. Lookups take the last value for a
+    duplicate key."""
 
     __slots__ = ("_buf", "_start", "_end", "_pairs")
 
-    KNOWN_KEYS = (b"shape", b"version", b"blob")
-    SHAPES = ("diff", "stream", "tabular", "document", "key-value")
+    KNOWN_KEYS = (b"shape", b"schema", b"version", b"blob")
+    SHAPES = ("diff", "stream")
 
     def __init__(self, buf: Bytes, start: int, end: int):
         self._buf = buf
@@ -649,12 +766,27 @@ class Heading:
         if span is None:
             raise NotFoundError(f"no heading key {_b(key)!r}")
         bs, be = _c0.unit_level(self._buf, *span)
-        return Body(self._buf, bs, be)
+        return Body(self._buf, bs, be, _valid=True)
 
     @property
     def shape(self) -> Optional[str]:
+        """The ``shape`` value (``diff`` or ``stream``; anything else is a warning)."""
         v = self.get("shape")
         return None if v is None else v.decode("utf-8", "replace")
+
+    @property
+    def schema(self):
+        """The schema the body claims: its name as ``bytes``, or the keyed
+        ``Record`` of ``name`` / ``url`` / ``hash`` when written as a level;
+        None when absent. The form is checked at parse time."""
+        span = self._find("schema")
+        if span is None:
+            return None
+        if _c0.unit_type(self._buf, *span) == UnitType.LEVEL:
+            bs, be = _c0.unit_level(self._buf, *span)
+            records = Body(self._buf, bs, be, _valid=True).records
+            return records[0] if records else None
+        return _c0.value(self._buf, *span)
 
     @property
     def version(self) -> int:
@@ -677,7 +809,7 @@ class Heading:
         if span is None or _c0.unit_type(self._buf, *span) != UnitType.LEVEL:
             return None
         bs, be = _c0.unit_level(self._buf, *span)
-        return Body(self._buf, bs, be)
+        return Body(self._buf, bs, be, _valid=True)
 
     @property
     def empty(self) -> bool:
@@ -692,19 +824,26 @@ class Heading:
 
 class Document:
     """One C0DATA document: an optional SYN heading, a body, an optional EOT.
-    ``Document(buf)`` reads the first document in the buffer; use
+    ``Document(buf)`` parses the first document in the buffer, applying the
+    whole grammar (a ``C0SyntaxError`` on malformed input); use
     ``Container`` for a buffer holding several documents or an EM tail.
-    ``warnings`` lists the loud warnings (no SYN, no EOT, unknown keys)."""
+    ``warnings`` lists the loud warnings (no SYN, no EOT, unknown keys,
+    shape or version, duplicate key). ``dead_elements`` counts the dead
+    records, header rows, groups and files met; ``supersession_grains``
+    lists the codes (US, SOH, RS, GS, FS) at which supersession was met."""
 
-    __slots__ = ("_buf", "start", "stop", "has_syn", "has_eot", "heading", "body", "warnings")
+    __slots__ = ("_buf", "start", "stop", "has_syn", "has_eot", "heading", "body", "warnings",
+                 "dead_elements", "supersession_grains")
 
     def __init__(self, buf: Bytes, start: int = 0, _parsed: Optional[tuple] = None):
         self._buf = buf
         t = _parsed if _parsed is not None else _c0.document(buf, start)
-        (self.start, self.stop, self.has_syn, self.has_eot, hs, he, bs, be, bits) = t
+        (self.start, self.stop, self.has_syn, self.has_eot, hs, he, bs, be, bits, dead, grains) = t
         self.heading = Heading(buf, hs, he)
-        self.body = Body(buf, bs, be)
+        self.body = Body(buf, bs, be, _valid=True)
         self.warnings = self._warnings(bits)
+        self.dead_elements = dead
+        self.supersession_grains = [c for c in (US, SOH, RS, GS, FS) if grains & (1 << (c & 31))]
 
     def _warnings(self, bits: int) -> list:
         out = []
@@ -836,18 +975,26 @@ class Container:
 
 class StreamReader:
     """An ETB-committed append log. An unescaped ETB is always a commit, even
-    inside open text or a level; such a block is damaged and yields nothing.
-    The tail after the last commit is torn unless it holds only layout,
-    notes, EOT or EM."""
+    inside open text or a level. A committed block that is not well-formed,
+    cut by its ETB or holding any other error, is **damaged**: nothing in it
+    is delivered and it adds nothing to the parse state. By default the
+    reader delivers the records before the first damaged block and then
+    raises ``DamagedBlockError`` with the offset to resume at; with
+    ``continue_past_damage=True`` it reads on past every damaged block. The
+    tail after the last commit is torn unless it holds only layout, notes,
+    EOT or EM."""
 
-    __slots__ = ("_buf", "committed_end", "torn", "_blocks", "damaged", "_undamaged")
+    __slots__ = ("_buf", "committed_end", "torn", "_blocks", "damaged", "continue_past_damage",
+                 "resume_offset", "_sound")
 
-    def __init__(self, buf: Bytes):
+    def __init__(self, buf: Bytes, continue_past_damage: bool = False):
         self._buf = buf
-        self.committed_end, self.torn, blocks = _c0.stream(buf)
+        self.continue_past_damage = continue_past_damage
+        self.committed_end, self.torn, blocks, has_damaged, _first, resume = _c0.stream(buf)
         self._blocks = [(s, e) for s, e, _ in blocks]
         self.damaged = [i for i, (_, _, d) in enumerate(blocks) if d]
-        self._undamaged = None
+        self.resume_offset = resume if has_damaged else None
+        self._sound = None
 
     @property
     def committed(self) -> memoryview:
@@ -875,31 +1022,71 @@ class StreamReader:
         return i in self.damaged
 
     @property
+    def has_damaged(self) -> bool:
+        return bool(self.damaged)
+
+    def block_end(self, i: int) -> int:
+        """Offset just past block ``i``'s ETB and payload: where reading can
+        resume after it."""
+        return self._blocks[i + 1][0] if i + 1 < len(self._blocks) else self.committed_end
+
+    @property
     def undamaged(self) -> bytes:
-        """The undamaged committed blocks, markers and payloads removed."""
-        if self._undamaged is None:
-            self._undamaged = _c0.stream_undamaged(self._buf)
-        return self._undamaged
+        """Every sound committed block, markers and payloads removed,
+        continuing past damage."""
+        return _c0.stream_undamaged(self._buf)
+
+    @property
+    def before_damage(self) -> bytes:
+        """The sound committed blocks before the first damaged one, markers
+        and payloads removed (all of them when none is damaged)."""
+        return _c0.stream_before_damage(self._buf)
+
+    def _check_damage(self) -> None:
+        if self.damaged and not self.continue_past_damage:
+            raise DamagedBlockError(self.damaged[0], self.resume_offset)
+
+    def _sound_container(self) -> Container:
+        if self._sound is None:
+            self._sound = Container(self.undamaged if self.continue_past_damage else self.before_damage)
+        return self._sound
+
+    @property
+    def container(self) -> Container:
+        """The committed region as documents, damaged blocks left out.
+        Raises ``DamagedBlockError`` when a block is damaged, unless continuing."""
+        self._check_damage()
+        return self._sound_container()
 
     @property
     def document(self) -> Document:
-        """The committed region as a document (undamaged blocks only)."""
-        return Document(self.undamaged)
+        """The first document of the committed region."""
+        return self.container.first
 
     @property
     def body(self) -> Body:
         return self.document.body
 
+    def iter_records(self) -> Iterator[Record]:
+        """Every committed record in order, header rows and heading excluded,
+        up to the first damaged block; then ``DamagedBlockError``, unless
+        continuing, in which case every record of every sound block."""
+        for doc in self._sound_container().documents:
+            for g in doc.body.groups:
+                for r in g.records:
+                    yield r
+        self._check_damage()
+
     @property
     def records(self) -> list:
-        """Every committed record, header rows and heading excluded."""
-        return [r for g in self.body.groups for r in g.records]
+        """``iter_records()`` as a list."""
+        return list(self.iter_records())
 
     def __len__(self) -> int:
         return len(self._blocks)
 
     def __iter__(self) -> Iterator[Record]:
-        return iter(self.records)
+        return self.iter_records()
 
 
 # ---- builder -----------------------------------------------------------------
@@ -907,17 +1094,18 @@ class StreamReader:
 class _LevelScope:
     """Closes a level on exit: ``with b.level(): ...``."""
 
-    __slots__ = ("_b",)
+    __slots__ = ("_b", "_close")
 
-    def __init__(self, b: "Builder"):
+    def __init__(self, b: "Builder", close: Optional[Callable[[], object]] = None):
         self._b = b
+        self._close = close if close is not None else b._b.level_close
 
     def __enter__(self) -> "Builder":
         return self._b
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         if exc_type is None:
-            self._b._b.level_close()
+            self._close()
         return False
 
 
@@ -940,27 +1128,30 @@ class Builder:
     """Writes C0DATA in canonical compact form over the C builder.
 
     Two layers. The primitives are one method per code (``fs``, ``gs``,
-    ``rs``, ``us``, ``sub`` (C0-DIFF only), ``soh``, ``dle``, ``can``,
-    ``bel``, ``enq``, ``syn``, ``eot``, ``etb``, ``em``); each writes its code and, when given, what
-    grammatically follows it, so a chain reads like the bytes::
+    ``rs``, ``us``, ``sub``, ``soh``, ``dle``, ``can``, ``bel``, ``enq``,
+    ``syn``, ``eot``, ``etb``, ``em``); each writes its code and, when given,
+    what grammatically follows it, so a chain reads like the bytes::
 
         b.rs("Alice").us("1502.30")                        # ␞Alice␟1502.30
         b.rs().soh("host").us("localhost").soh("port").us("5432")
         b.bel().gs("old")                                  # a dead group
+        b.rs("old").sub().us("new")                        # ␞old␚␟new: old superseded by new
+        b.rs().enq("tags").us().enq(lambda: b.gs("tags").rs("001"))  # ␞␅tags␟␅␐␝tags␞001␘
 
     The composed methods (``file``, ``group``, ``header``, ``record``,
-    ``field``, ``map``, ``key``, ``level``, ``list``, ``ref``, ``note``) are
-    built on the primitives and cannot write ill-formed output. The
-    primitives write what you spell; well-formedness is then yours to keep.
-    Both layers share the record state, so they mix.
+    ``field``, ``supersede``, ``map``, ``key``, ``level``, ``list``, ``ref``,
+    ``note``) are built on the primitives and cannot write ill-formed output.
+    The primitives write what you spell; well-formedness is then yours to
+    keep. Both layers share the record state, so they mix.
 
     Values are byte-transparent and written in their one spelling: plain when
     they can be, text otherwise with only the seven codes escaped. Names
-    (file, group, header, key, reference segment, ETB payload) must be plain
+    (file, group, header, key, group reference, ETB payload) must be plain
     or ``BuildError`` is raised. Every method returns the builder, so calls
-    chain; ``level()`` and ``key_level()`` are context managers that close
-    the level on exit. Use ``with Builder() as b:`` or ``close()`` to release
-    the buffer early; otherwise it is freed when the builder is collected.
+    chain; ``level()``, ``key_level()``, ``ref()`` and ``enq()`` without
+    arguments are context managers that close the level on exit. Use ``with
+    Builder() as b:`` or ``close()`` to release the buffer early; otherwise
+    it is freed when the builder is collected.
     """
 
     __slots__ = ("_b",)
@@ -1001,14 +1192,12 @@ class Builder:
             self._b.us(_b(value))
         return self
 
-    def sub(self, value: Optional[Str] = None) -> "Builder":
-        """SUB and, when given, the new side of a substitution. C0-DIFF only:
-        ``rs("old").sub("new")`` is a replace-all; in a data body SUB is an
-        error. Does not change the unit count."""
-        if value is None:
-            self._b.sub()
-        else:
-            self._b.sub(_b(value))
+    def sub(self) -> "Builder":
+        """SUB: the element before the next separator or opener is
+        superseded by the one after it. ``rs("old").sub().us("new")`` writes
+        ``␞old␚␟new``; before ``rs``, ``gs``, ``fs`` or ``soh`` it supersedes
+        at that grain."""
+        self._b.sub()
         return self
 
     def soh(self, name: Optional[Str] = None) -> "Builder":
@@ -1038,13 +1227,21 @@ class Builder:
             self._b.bel(_b(text))
         return self
 
-    def enq(self, *path: Str) -> "Builder":
-        """ENQ and a reference: a group name (``␅name``), or a path of two or
-        three names (``␅␂a␟b␟c␃``)."""
-        segs = _fields(path)
-        if not segs:
-            raise TypeError("enq() requires at least one segment")
-        self._b.enq(segs)
+    def enq(self, name_or_fn: Union[Str, Callable[[], object], None] = None):
+        """ENQ and a reference: a group name (``␅name``), or a pattern, a
+        level that is the target with its values left out, built by the
+        callable (``enq(lambda: b.gs("tags").rs("001").us("label"))`` writes
+        ``␅␐␝tags␞001␟label␘``). With no argument, a context manager that
+        opens the pattern and closes it on exit."""
+        if name_or_fn is None:
+            self._b.enq_dle()
+            return _LevelScope(self, self._b.can)
+        if callable(name_or_fn):
+            self._b.enq_dle()
+            name_or_fn()
+            self._b.can()
+            return self
+        self._b.enq(_b(name_or_fn))
         return self
 
     def syn(self, pairs=None, **kw) -> "Builder":
@@ -1116,6 +1313,12 @@ class Builder:
         self._b.field(_b(value))
         return self
 
+    def supersede(self, old: Str, new: Str) -> "Builder":
+        """A superseded unit: ``old`` superseded by ``new``, written
+        ``old␚␟new`` as the next unit and the one after it."""
+        self._b.supersede(_b(old), _b(new))
+        return self
+
     def map(self, pairs=None, **kw) -> "Builder":
         """A keyed record: a map, entries in the order given."""
         ps = _pairs(pairs, kw)
@@ -1165,13 +1368,27 @@ class Builder:
         self._b.list([_b(i) for i in items])
         return self
 
-    def ref(self, *path: Str) -> "Builder":
-        """A reference as the next unit: ENQ name, or for two or three
-        segments ENQ STX seg US seg [US seg] ETX."""
-        segs = _fields(path)
-        if not segs:
-            raise TypeError("ref() requires at least one segment")
-        self._b.ref_path(segs)
+    def ref(self, group: Union[Str, Callable[[], object], None] = None,
+            record: Optional[Str] = None, field: Optional[Str] = None):
+        """A reference as the next unit. ``ref("tags")`` is a group reference
+        (``␅tags``); ``ref("tags", "001")`` and ``ref("tags", "001", "label")``
+        are the patterns ``␅␐␝tags␞001␘`` and ``␅␐␝tags␞001␟label␘``;
+        ``ref(fn)`` writes the pattern ``fn`` builds; with no argument, a
+        context manager that opens the pattern and closes it on exit."""
+        if group is None:
+            self._b.ref_open()
+            return _LevelScope(self)
+        if callable(group):
+            self._b.ref_open()
+            group()
+            self._b.level_close()
+            return self
+        if record is None:
+            if field is not None:
+                raise TypeError("ref() takes a field only with a record")
+            self._b.ref(_b(group))
+        else:
+            self._b.ref_record(_b(group), _b(record), None if field is None else _b(field))
         return self
 
     # ---- comments
@@ -1212,3 +1429,10 @@ def build(fn: Callable[[Builder], object]) -> bytes:
     with Builder() as b:
         fn(b)
         return b.bytes
+
+
+# ---- C0DIFF ------------------------------------------------------------------
+
+from . import diff  # noqa: E402  (needs Builder above)
+from .diff import DiffBuilder, PatternBuilder, parse_diff  # noqa: E402
+from .diff import apply as apply_diff  # noqa: E402

@@ -1,4 +1,5 @@
-"""Builder primitives: one method per code, mirroring the Crystal Builder specs."""
+"""Builder primitives: one method per code, mirroring the Crystal Builder specs
+(spec/builder_spec.cr and the builder part of spec/redesign_spec.cr)."""
 
 import unittest
 
@@ -30,13 +31,15 @@ class Primitives(unittest.TestCase):
         self.assertSpells(build(lambda b: b.bel("checked").rs("x")), "␇checked␞x")
         self.assertSpells(build(lambda b: b.bel().gs("old").rs("1").gs("new").rs("2")),
                           "␇␝old␞1␝new␞2")
-        self.assertSpells(build(lambda b: b.gs().gs("sub").rs().enq("users").us().enq("users", "1")),
-                          "␝␝sub␞␅users␟␅␂users␟1␃")
+        self.assertSpells(build(lambda b: b.gs().gs("sub").rs().enq("users").us().enq(lambda: b.gs("users").rs("1"))),
+                          "␝␝sub␞␅users␟␅␐␝users␞1␘")
         self.assertSpells(build(lambda b: b.syn().soh("version").us("1").rs("a").eot()),
                           "␖␁version␟1␞a␄")
-        # C0-DIFF only: a replace-all, then a pattern with one substitution
-        self.assertSpells(build(lambda b: b.fs("f").rs("old").sub("new").gs("x").us("10").sub("20")),
-                          "␜f␞old␚new␝x␟10␚20")
+        # supersession: SUB before a separator or opener, at every grain
+        self.assertSpells(build(lambda b: b.rs("old").sub().us("new")), "␞old␚␟new")
+        self.assertSpells(build(lambda b: b.fs("f").rs("a").sub().rs("b").gs("x").sub().gs("y").sub().fs("g")),
+                          "␜f␞a␚␞b␝x␚␝y␚␜g")
+        self.assertSpells(build(lambda b: b.rs().soh("k").us("1").sub().soh("k").us("2")), "␞␁k␟1␚␁k␟2")
         self.assertSpells(build(lambda b: b.rs("old").sub()), "␞old␚")
         self.assertSpells(build(lambda b: b.rs("a").etb("c1").rs("b").etb()), "␞a␗c1␞b␗")
         self.assertEqual(build(lambda b: b.rs("a").em(b"\xff\x00tail")), b"\x1ea\x19\xff\x00tail")
@@ -68,9 +71,15 @@ class Primitives(unittest.TestCase):
         with self.assertRaises(c0.BuildError):
             build(lambda b: b.can())
         with self.assertRaises(c0.BuildError):
-            build(lambda b: b.rs().enq("a", "b", "c", "d"))
-        with self.assertRaises(TypeError):
-            build(lambda b: b.rs().enq())
+            build(lambda b: b.rs().enq(""))
+        with self.assertRaises(c0.BuildError):
+            build(lambda b: b.rs().enq("a\x1fb"))
+        # enq() with no argument opens a pattern and closes it on exit
+        with c0.Builder() as b:
+            b.rs()
+            with b.enq():
+                b.gs("tags").rs("001")
+            self.assertSpells(b.bytes, "␞␅␐␝tags␞001␘")
 
     def test_primitives_update_the_record_state(self):
         # us() after dle()/can() resumes the outer record's unit count.
@@ -97,13 +106,15 @@ class Primitives(unittest.TestCase):
             b.list(["x", "y"]),
             b.ref("users", "1"),
             b.level(lambda l: l.record("i")),
+            b.supersede("p", "q"),
             b.eot(),
         ))
         lo = build(lambda b: (
             b.syn().soh("shape").us("tabular"),
             b.gs("users").soh().rs("name").us("amount").rs("Alice").us("1502.30").rs("Bob").us("3 40"),
             b.gs("cfg").rs().soh("host").us("localhost").soh("port").us("5432"),
-            b.rs("r").us().dle().rs("x").us("y").can().us().enq("users", "1").us().dle().rs("i").can(),
+            b.rs("r").us().dle().rs("x").us("y").can().us().enq(lambda: b.gs("users").rs("1")).us().dle().rs("i").can(),
+            b.us("p").sub().us("q"),
             b.eot(),
         ))
         self.assertEqual(lo, hi)
@@ -112,8 +123,9 @@ class Primitives(unittest.TestCase):
     def test_everything_returns_the_builder(self):
         b = c0.Builder()
         for r in (b.syn(), b.soh("k"), b.us("v"), b.fs("f"), b.gs(), b.gs("g"), b.rs(), b.us(),
-                  b.rs("a"), b.dle(), b.can(), b.bel(), b.rs("x"), b.sub(), b.sub("n"), b.bel("n"), b.rs("y"), b.us(),
-                  b.enq("g"), b.eot(), b.etb(), b.etb("p"), b.em(b"")):
+                  b.rs("a"), b.dle(), b.can(), b.bel(), b.rs("x"), b.sub(), b.us("n"), b.bel("n"), b.rs("y"), b.us(),
+                  b.enq("g"), b.us(), b.enq(lambda: b.gs("g")), b.supersede("o", "n"), b.ref("g"), b.ref("g", "1"),
+                  b.ref(lambda: b.gs("g")), b.eot(), b.etb(), b.etb("p"), b.em(b"")):
             self.assertIs(r, b)
         b.close()
 

@@ -1,3 +1,6 @@
 include c0-c/c0.h
+include c0-c/c0_diff.h
+include c0-c/c0_diff.c
+include c0-c/c0_strbuf.h
 include README.md
 include LICENSE

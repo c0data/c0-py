@@ -39,3 +39,20 @@ class NotFoundError(C0Error, LookupError):
 class BuildError(C0Error):
     """A builder call with a bad name (control byte or edge whitespace) or in
     a bad state (a level closed that was never opened, an empty note)."""
+
+
+class DiffError(C0Error):
+    """A C0DIFF that cannot be applied: it holds something a diff may not
+    (DIFF.md), names a file that is not there, or a record's search text is
+    empty, missing or ambiguous."""
+
+
+class DamagedBlockError(C0Error):
+    """A committed stream block that is not well-formed (DESIGN.md, Damaged
+    Blocks). ``index`` is the block's index; ``resume_offset`` is where
+    reading can go on, after the block's ETB and payload."""
+
+    def __init__(self, index: int, resume_offset: int):
+        super().__init__(f"block {index} is damaged; reading can resume at byte {resume_offset}")
+        self.index = index
+        self.resume_offset = resume_offset

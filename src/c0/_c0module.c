@@ -10,11 +10,12 @@
 
 #define C0_IMPLEMENTATION
 #include "c0.h"
+#include "c0_diff.h"
 
 /* ---- errors --------------------------------------------------------------- */
 
 static PyObject *Exc_C0Error, *Exc_Syntax, *Exc_Unassigned, *Exc_UnexpectedEnd,
-    *Exc_UnitType, *Exc_NotFound, *Exc_Build;
+    *Exc_UnitType, *Exc_NotFound, *Exc_Build, *Exc_Diff;
 
 static const char *status_message(c0_status code) {
     switch (code) {
@@ -30,7 +31,7 @@ static const char *status_message(c0_status code) {
     case C0_ERR_NEEDS_DECODE: return "text needs decoding";
     case C0_ERR_NOT_FOUND: return "not found";
     case C0_ERR_BAD_NAME: return "not a name: control byte, edge whitespace or empty where a name is required";
-    case C0_ERR_BAD_STATE: return "builder in a bad state: a level closed that was never opened, or an empty note";
+    case C0_ERR_BAD_STATE: return "builder in a bad state: a level closed that was never opened, an empty note, or an empty reference";
     case C0_ERR_OOM: return "out of memory";
     }
     return "error";
@@ -309,32 +310,33 @@ static PyObject *py_unit_level(PyObject *self, PyObject *args) {
     return Py_BuildValue("(nn)", off + (Py_ssize_t)body.start, off + (Py_ssize_t)body.stop);
 }
 
-/* The raw unit [s, e) as a reference: a list of segment spans. */
+/* The raw unit [s, e) as a reference: (is_pattern, a, b) where [a, b) is the
+ * group name of a plain reference, or the body range of a pattern's level. */
 static PyObject *py_unit_ref(PyObject *self, PyObject *args) {
     Py_buffer v;
-    Py_ssize_t s, e;
+    Py_ssize_t s, e, a, b;
     c0_ref ref;
     c0_status st;
-    PyObject *out;
-    size_t i;
+    const uint8_t *base;
     (void)self;
     if (!parse_range(args, &v, &s, &e)) return NULL;
+    base = (const uint8_t *)v.buf;
     st = c0_unit_ref(slice_of(&v, s, e), &ref);
     if (st != C0_OK) {
         PyBuffer_Release(&v);
         return raise_status(st, NULL);
     }
-    out = PyList_New(0);
-    if (out) {
-        for (i = 0; i < ref.count; i++) {
-            if (append_span(out, (const uint8_t *)v.buf, ref.seg[i]) != 0) {
-                Py_CLEAR(out);
-                break;
-            }
-        }
+    if (ref.is_pattern) {
+        /* the pattern's buf is the trimmed unit: rebase its range onto the buffer */
+        Py_ssize_t off = (Py_ssize_t)(ref.pattern.buf - base);
+        a = off + (Py_ssize_t)ref.pattern.start;
+        b = off + (Py_ssize_t)ref.pattern.stop;
+    } else {
+        a = (Py_ssize_t)(ref.name.ptr - base);
+        b = a + (Py_ssize_t)ref.name.len;
     }
     PyBuffer_Release(&v);
-    return out;
+    return Py_BuildValue("(Onn)", ref.is_pattern ? Py_True : Py_False, a, b);
 }
 
 /* Drain a unit iterator into a list of spans; raises on its error. */
@@ -400,6 +402,41 @@ static PyObject *py_record_units(PyObject *self, PyObject *args) {
     return out;
 }
 
+/* Every positional unit of the record [s, e) as written: a list of
+ * (start, end, superseded). */
+static PyObject *py_record_written_units(PyObject *self, PyObject *args) {
+    Py_buffer v;
+    Py_ssize_t s, e;
+    c0_unit_iter it;
+    c0_bytes raw;
+    int sup;
+    const uint8_t *base;
+    PyObject *out;
+    (void)self;
+    if (!parse_range(args, &v, &s, &e)) return NULL;
+    base = (const uint8_t *)v.buf;
+    it = c0_record_written_units(record_of(&v, s, e));
+    out = PyList_New(0);
+    if (!out) {
+        PyBuffer_Release(&v);
+        return NULL;
+    }
+    while (c0_next_written_unit(&it, &raw, &sup)) {
+        Py_ssize_t us = (Py_ssize_t)(raw.ptr - base);
+        if (append_steal(out, Py_BuildValue("(nnO)", us, us + (Py_ssize_t)raw.len, sup ? Py_True : Py_False)) != 0) {
+            Py_DECREF(out);
+            PyBuffer_Release(&v);
+            return NULL;
+        }
+    }
+    PyBuffer_Release(&v);
+    if (it.err.code) {
+        Py_DECREF(out);
+        return raise_status(it.err.code, &it.err);
+    }
+    return out;
+}
+
 /* Keyed units of the range [s, e) (a keyed record or a heading):
  * a list of (key_start, key_end, value_start, value_end). */
 static PyObject *py_pairs(PyObject *self, PyObject *args) {
@@ -437,7 +474,26 @@ static PyObject *py_pairs(PyObject *self, PyObject *args) {
 
 /* ---- bodies --------------------------------------------------------------- */
 
-/* Files of the body [s, e): a list of (name_start, name_end, start, stop). */
+/* Parse the slice [s, e) as a body (no SYN, heading or EOT): the whole
+ * grammar is applied to it; None, or the first error at its buffer offset. */
+static PyObject *py_body_read(PyObject *self, PyObject *args) {
+    Py_buffer v;
+    Py_ssize_t s, e;
+    c0_body body;
+    c0_error err;
+    c0_status st;
+    (void)self;
+    if (!parse_range(args, &v, &s, &e)) return NULL;
+    st = c0_body_read((const uint8_t *)v.buf + s, (size_t)(e - s), &body, &err);
+    PyBuffer_Release(&v);
+    if (st != C0_OK) {
+        err.pos += (size_t)s;
+        return raise_status(st, &err);
+    }
+    Py_RETURN_NONE;
+}
+
+/* Files of the body [s, e): a list of (name_start, name_end, start, stop, leading). */
 static PyObject *py_body_files(PyObject *self, PyObject *args) {
     Py_buffer v;
     Py_ssize_t s, e;
@@ -453,8 +509,9 @@ static PyObject *py_body_files(PyObject *self, PyObject *args) {
         return NULL;
     }
     while (c0_next_file(&it, &f)) {
-        if (append_steal(out, Py_BuildValue("(nnnn)", (Py_ssize_t)f.name_start, (Py_ssize_t)f.name_end,
-                                            (Py_ssize_t)f.start, (Py_ssize_t)f.stop)) != 0) {
+        if (append_steal(out, Py_BuildValue("(nnnnO)", (Py_ssize_t)f.name_start, (Py_ssize_t)f.name_end,
+                                            (Py_ssize_t)f.start, (Py_ssize_t)f.stop,
+                                            f.leading ? Py_True : Py_False)) != 0) {
             Py_DECREF(out);
             PyBuffer_Release(&v);
             return NULL;
@@ -485,15 +542,16 @@ static PyObject *drain_groups(c0_group_iter *it) {
     return out;
 }
 
-/* Groups of the file (name_start, name_end, start, stop). */
+/* Groups of the file (name_start, name_end, start, stop, leading). */
 static PyObject *py_file_groups(PyObject *self, PyObject *args) {
     Py_buffer v;
     Py_ssize_t ns, ne, s, e;
+    int leading = 0;
     c0_file f;
     c0_group_iter it;
     PyObject *out;
     (void)self;
-    if (!PyArg_ParseTuple(args, "y*nnnn", &v, &ns, &ne, &s, &e)) return NULL;
+    if (!PyArg_ParseTuple(args, "y*nnnnp", &v, &ns, &ne, &s, &e, &leading)) return NULL;
     if (ns < 0 || ne < ns || ne > v.len || s < 0 || e < s || e > v.len) {
         PyBuffer_Release(&v);
         PyErr_SetString(PyExc_IndexError, "range outside the buffer");
@@ -504,6 +562,7 @@ static PyObject *py_file_groups(PyObject *self, PyObject *args) {
     f.name_end = (size_t)ne;
     f.start = (size_t)s;
     f.stop = (size_t)e;
+    f.leading = leading;
     it = c0_file_groups(f);
     out = drain_groups(&it);
     PyBuffer_Release(&v);
@@ -596,14 +655,15 @@ static PyObject *py_group_records(PyObject *self, PyObject *args) {
 /* ---- documents and containers --------------------------------------------- */
 
 static PyObject *document_tuple(const c0_document *d) {
-    return Py_BuildValue("(nnOOnnnnI)", (Py_ssize_t)d->start, (Py_ssize_t)d->stop,
+    return Py_BuildValue("(nnOOnnnnInI)", (Py_ssize_t)d->start, (Py_ssize_t)d->stop,
                          d->has_syn ? Py_True : Py_False, d->has_eot ? Py_True : Py_False,
                          (Py_ssize_t)d->heading_start, (Py_ssize_t)d->heading_end,
-                         (Py_ssize_t)d->body.start, (Py_ssize_t)d->body.stop, d->warnings);
+                         (Py_ssize_t)d->body.start, (Py_ssize_t)d->body.stop, d->warnings,
+                         (Py_ssize_t)d->dead_elements, d->sup_grains);
 }
 
 /* Read the document at `start`: (start, stop, has_syn, has_eot, heading_start,
- * heading_end, body_start, body_stop, warning_bits). */
+ * heading_end, body_start, body_stop, warning_bits, dead_elements, sup_grains). */
 static PyObject *py_document(PyObject *self, PyObject *args) {
     Py_buffer v;
     Py_ssize_t start = 0;
@@ -675,7 +735,7 @@ static PyObject *py_blob(PyObject *self, PyObject *args) {
 
 /* ---- stream --------------------------------------------------------------- */
 
-/* (committed_end, torn, [(start, end, damaged)]). */
+/* (committed_end, torn, [(start, end, damaged)], has_damaged, first_damaged, resume_offset). */
 static PyObject *py_stream(PyObject *self, PyObject *args) {
     Py_buffer v;
     const uint8_t *base;
@@ -704,16 +764,18 @@ static PyObject *py_stream(PyObject *self, PyObject *args) {
         }
     }
     PyBuffer_Release(&v);
-    return Py_BuildValue("(nON)", (Py_ssize_t)s.committed_end, s.torn ? Py_True : Py_False, blocks);
+    return Py_BuildValue("(nONOnn)", (Py_ssize_t)s.committed_end, s.torn ? Py_True : Py_False, blocks,
+                         s.has_damaged ? Py_True : Py_False, (Py_ssize_t)s.first_damaged,
+                         (Py_ssize_t)s.resume_offset);
 }
 
-/* The undamaged committed blocks, markers and payloads removed, as bytes. */
-static PyObject *py_stream_undamaged(PyObject *self, PyObject *args) {
+/* The sound committed blocks, markers and payloads removed, as bytes: every
+ * one of them (continuing past damage), or those before the first damaged block. */
+static PyObject *stream_copy(PyObject *args, int stop_at_damage) {
     Py_buffer v;
     c0_stream s;
     PyObject *out;
     size_t n;
-    (void)self;
     if (!PyArg_ParseTuple(args, "y*", &v)) return NULL;
     s = c0_stream_read((const uint8_t *)v.buf, (size_t)v.len);
     out = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)s.committed_end);
@@ -721,9 +783,183 @@ static PyObject *py_stream_undamaged(PyObject *self, PyObject *args) {
         PyBuffer_Release(&v);
         return NULL;
     }
-    n = c0_stream_undamaged(&s, (uint8_t *)PyBytes_AS_STRING(out));
+    n = stop_at_damage ? c0_stream_before_damage(&s, (uint8_t *)PyBytes_AS_STRING(out))
+                       : c0_stream_undamaged(&s, (uint8_t *)PyBytes_AS_STRING(out));
     PyBuffer_Release(&v);
     if (_PyBytes_Resize(&out, (Py_ssize_t)n) != 0) return NULL;
+    return out;
+}
+
+static PyObject *py_stream_undamaged(PyObject *self, PyObject *args) {
+    (void)self;
+    return stream_copy(args, 0);
+}
+
+static PyObject *py_stream_before_damage(PyObject *self, PyObject *args) {
+    (void)self;
+    return stream_copy(args, 1);
+}
+
+/* ---- C0DIFF --------------------------------------------------------------- */
+
+static const char *diff_status_message(c0_diff_status st) {
+    switch (st) {
+    case C0_DIFF_OK: return "ok";
+    case C0_DIFF_SYNTAX: return "the diff is not well-formed";
+    case C0_DIFF_WRONG_SHAPE: return "heading declares a shape that is not diff";
+    case C0_DIFF_CONSTRAINT: return "the diff holds something a diff may not";
+    case C0_DIFF_DUPLICATE_PATH: return "the same path twice";
+    case C0_DIFF_FILE_NOT_FOUND: return "no such file";
+    case C0_DIFF_EMPTY_SEARCH: return "empty search text";
+    case C0_DIFF_PATTERN_NOT_FOUND: return "pattern not found";
+    case C0_DIFF_PATTERN_AMBIGUOUS: return "pattern matched more than once";
+    case C0_DIFF_OOM: return "out of memory";
+    }
+    return "diff error";
+}
+
+/* Raise for a diff status: C0SyntaxError (with its position) when the diff is
+ * malformed, else DiffError naming the file when one is known. Returns NULL. */
+static PyObject *raise_diff(c0_diff_status st, const char *msg, size_t pos, const char *path) {
+    PyObject *inst;
+    if (st == C0_DIFF_OOM) return PyErr_NoMemory();
+    if (!msg || !msg[0]) msg = diff_status_message(st);
+    if (st == C0_DIFF_SYNTAX) {
+        inst = PyObject_CallFunction(Exc_Syntax, "sn", msg, (Py_ssize_t)pos);
+        if (!inst) return NULL;
+        PyErr_SetObject(Exc_Syntax, inst);
+        Py_DECREF(inst);
+        return NULL;
+    }
+    if (path && path[0]) {
+        PyErr_Format(Exc_Diff, "%s: %s", msg, path);
+    } else {
+        PyErr_SetString(Exc_Diff, msg);
+    }
+    return NULL;
+}
+
+/* Parse a diff document: a list of (path, records), each record a list of
+ * (old, new) with new None for an anchor. */
+static PyObject *py_diff_parse(PyObject *self, PyObject *args) {
+    Py_buffer v;
+    c0_diff d;
+    PyObject *files = NULL;
+    size_t i, j, k;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "y*", &v)) return NULL;
+    d = c0_diff_parse((const uint8_t *)v.buf, (size_t)v.len);
+    PyBuffer_Release(&v);
+    if (d.status != C0_DIFF_OK) {
+        raise_diff(d.status, d.err.msg, d.err.pos, NULL);
+        c0_diff_free(&d);
+        return NULL;
+    }
+    files = PyList_New(0);
+    if (!files) goto fail;
+    for (i = 0; i < d.nfiles; i++) {
+        const c0_diff_file *f = &d.files[i];
+        PyObject *records = PyList_New(0), *entry;
+        if (!records) goto fail;
+        for (j = 0; j < f->nrecords; j++) {
+            const c0_diff_record *r = &f->records[j];
+            PyObject *units = PyList_New(0);
+            if (!units) {
+                Py_DECREF(records);
+                goto fail;
+            }
+            for (k = 0; k < r->nunits; k++) {
+                const c0_diff_unit *u = &r->units[k];
+                PyObject *t;
+                if (u->is_sub) {
+                    t = Py_BuildValue("(y#y#)", (const char *)u->old, (Py_ssize_t)u->old_len,
+                                      (const char *)u->new_, (Py_ssize_t)u->new_len);
+                } else {
+                    t = Py_BuildValue("(y#O)", (const char *)u->old, (Py_ssize_t)u->old_len, Py_None);
+                }
+                if (append_steal(units, t) != 0) {
+                    Py_DECREF(units);
+                    Py_DECREF(records);
+                    goto fail;
+                }
+            }
+            if (append_steal(records, units) != 0) {
+                Py_DECREF(records);
+                goto fail;
+            }
+        }
+        entry = Py_BuildValue("(y#N)", (const char *)f->path, (Py_ssize_t)f->path_len, records);
+        if (append_steal(files, entry) != 0) goto fail;
+    }
+    c0_diff_free(&d);
+    return files;
+fail:
+    Py_XDECREF(files);
+    c0_diff_free(&d);
+    return NULL;
+}
+
+/* Apply a diff to a sequence of (path, content) bytes pairs: the edited
+ * files, one per input in input order, or an error with nothing produced. */
+static PyObject *py_diff_apply(PyObject *self, PyObject *args) {
+    Py_buffer v;
+    PyObject *seqobj, *seq, *out = NULL;
+    c0_diff_file_input *in = NULL;
+    c0_diff_file_output *outs = NULL;
+    size_t n = 0, nout = 0, i;
+    Py_ssize_t count;
+    c0_diff_error err;
+    int ok;
+    (void)self;
+    if (!PyArg_ParseTuple(args, "y*O", &v, &seqobj)) return NULL;
+    seq = PySequence_Fast(seqobj, "expected a sequence of (path, content) pairs");
+    if (!seq) {
+        PyBuffer_Release(&v);
+        return NULL;
+    }
+    count = PySequence_Fast_GET_SIZE(seq);
+    in = (c0_diff_file_input *)PyMem_Malloc((size_t)(count ? count : 1) * sizeof(c0_diff_file_input));
+    if (!in) {
+        PyErr_NoMemory();
+        goto done;
+    }
+    for (i = 0; i < (size_t)count; i++) {
+        PyObject *item = PySequence_Fast_GET_ITEM(seq, (Py_ssize_t)i);
+        char *p, *c;
+        Py_ssize_t plen, clen;
+        if (!PyTuple_Check(item) || PyTuple_GET_SIZE(item) != 2) {
+            PyErr_SetString(PyExc_TypeError, "expected (path, content) pairs");
+            goto done;
+        }
+        if (PyBytes_AsStringAndSize(PyTuple_GET_ITEM(item, 0), &p, &plen) != 0 ||
+            PyBytes_AsStringAndSize(PyTuple_GET_ITEM(item, 1), &c, &clen) != 0) goto done;
+        in[i].path.ptr = (const uint8_t *)p;
+        in[i].path.len = (size_t)plen;
+        in[i].content.ptr = (const uint8_t *)c;
+        in[i].content.len = (size_t)clen;
+    }
+    n = (size_t)count;
+    memset(&err, 0, sizeof(err));
+    ok = c0_diff_apply((const uint8_t *)v.buf, (size_t)v.len, in, n, &outs, &nout, &err);
+    if (!ok) {
+        raise_diff(err.status, err.msg, err.pos, err.path);
+        goto done;
+    }
+    out = PyList_New(0);
+    if (!out) goto done;
+    for (i = 0; i < nout; i++) {
+        PyObject *t = Py_BuildValue("(y#y#)", (const char *)outs[i].path, (Py_ssize_t)outs[i].path_len,
+                                    (const char *)outs[i].content, (Py_ssize_t)outs[i].content_len);
+        if (append_steal(out, t) != 0) {
+            Py_CLEAR(out);
+            break;
+        }
+    }
+    c0_diff_free_outputs(outs, nout);
+done:
+    PyMem_Free(in);
+    Py_DECREF(seq);
+    PyBuffer_Release(&v);
     return out;
 }
 
@@ -871,12 +1107,14 @@ static c0_bytes *bytes_array(PyObject *seqobj, PyObject **seq, size_t *count) {
 
 BUILDER_NOARGS_METHOD(dle, c0_builder_dle)
 BUILDER_NOARGS_METHOD(can, c0_builder_can)
+BUILDER_NOARGS_METHOD(sub, c0_builder_sub)
+BUILDER_NOARGS_METHOD(enq_dle, c0_builder_enq_dle)
 BUILDER_NOARGS_METHOD(syn, c0_builder_syn)
 BUILDER_NOARGS_METHOD(eot, c0_builder_eot)
+BUILDER_NOARGS_METHOD(ref_open, c0_build_ref_open)
 BUILDER_OPT_BYTES_METHOD(gs, c0_builder_gs, c0_builder_gs_name)
 BUILDER_OPT_BYTES_METHOD(rs, c0_builder_rs, c0_builder_rs_value)
 BUILDER_OPT_BYTES_METHOD(us, c0_builder_us, c0_builder_us_value)
-BUILDER_OPT_BYTES_METHOD(sub, c0_builder_sub, c0_builder_sub_value)
 BUILDER_OPT_BYTES_METHOD(soh, c0_builder_soh, c0_builder_soh_name)
 BUILDER_OPT_BYTES_METHOD(bel, c0_builder_bel, c0_builder_bel_text)
 BUILDER_OPT_BYTES_METHOD(etb, c0_builder_etb, c0_builder_etb_payload)
@@ -896,6 +1134,7 @@ BUILDER_OPT_BYTES_METHOD(etb, c0_builder_etb, c0_builder_etb_payload)
     }
 
 BUILDER_BYTES_METHOD(fs, c0_builder_fs)
+BUILDER_BYTES_METHOD(enq, c0_builder_enq)
 BUILDER_BYTES_METHOD(em, c0_builder_em)
 BUILDER_BYTES_METHOD(file, c0_build_file)
 BUILDER_BYTES_METHOD(group, c0_build_group)
@@ -936,11 +1175,48 @@ static PyObject *Builder_section(BuilderObject *self, PyObject *args) {
         return builder_check(self);                                           \
     }
 
-BUILDER_SEQ_METHOD(enq, c0_builder_enq_path)
 BUILDER_SEQ_METHOD(header, c0_build_header)
 BUILDER_SEQ_METHOD(record, c0_build_record)
 BUILDER_SEQ_METHOD(list, c0_build_list)
-BUILDER_SEQ_METHOD(ref_path, c0_build_ref_path)
+
+/* ␅␐␝group␞record[␟field]␘ as the next unit; field None to omit it. */
+static PyObject *Builder_ref_record(BuilderObject *self, PyObject *args) {
+    Py_buffer g, r, f = {0};
+    PyObject *fobj = Py_None;
+    if (!PyArg_ParseTuple(args, "y*y*|O", &g, &r, &fobj)) return NULL;
+    if (fobj != Py_None && PyObject_GetBuffer(fobj, &f, PyBUF_SIMPLE) != 0) {
+        PyBuffer_Release(&g);
+        PyBuffer_Release(&r);
+        return NULL;
+    }
+    if (!builder_open(self)) {
+        PyBuffer_Release(&g);
+        PyBuffer_Release(&r);
+        if (f.obj) PyBuffer_Release(&f);
+        return NULL;
+    }
+    c0_build_ref_record(&self->b, (const uint8_t *)g.buf, (size_t)g.len, (const uint8_t *)r.buf, (size_t)r.len,
+                        f.obj ? (const uint8_t *)f.buf : NULL, f.obj ? (size_t)f.len : 0);
+    PyBuffer_Release(&g);
+    PyBuffer_Release(&r);
+    if (f.obj) PyBuffer_Release(&f);
+    return builder_check(self);
+}
+
+/* old␚␟new: the next unit, superseded by the one after it. */
+static PyObject *Builder_supersede(BuilderObject *self, PyObject *args) {
+    Py_buffer o, n;
+    if (!PyArg_ParseTuple(args, "y*y*", &o, &n)) return NULL;
+    if (!builder_open(self)) {
+        PyBuffer_Release(&o);
+        PyBuffer_Release(&n);
+        return NULL;
+    }
+    c0_build_supersede(&self->b, (const uint8_t *)o.buf, (size_t)o.len, (const uint8_t *)n.buf, (size_t)n.len);
+    PyBuffer_Release(&o);
+    PyBuffer_Release(&n);
+    return builder_check(self);
+}
 
 static PyObject *Builder_map(BuilderObject *self, PyObject *args) {
     PyObject *kobj, *vobj, *kseq, *vseq;
@@ -1030,12 +1306,13 @@ static PyMethodDef Builder_methods[] = {
     {"gs", (PyCFunction)Builder_gs, METH_VARARGS, "GS and an optional group name; gs(), gs(name) is depth 2."},
     {"rs", (PyCFunction)Builder_rs, METH_VARARGS, "RS and an optional first value: opens a record."},
     {"us", (PyCFunction)Builder_us, METH_VARARGS, "US and an optional value."},
-    {"sub", (PyCFunction)Builder_sub, METH_VARARGS, "SUB and an optional value: the new side of a substitution. C0-DIFF only."},
+    {"sub", (PyCFunction)Builder_sub, METH_NOARGS, "SUB: the element before the next separator or opener is superseded by the one after."},
     {"soh", (PyCFunction)Builder_soh, METH_VARARGS, "SOH and an optional key; bare before rs() it opens a header row."},
     {"dle", (PyCFunction)Builder_dle, METH_NOARGS, "DLE: open a level (saves the record state)."},
     {"can", (PyCFunction)Builder_can, METH_NOARGS, "CAN: close the innermost level; BuildError if none is open."},
     {"bel", (PyCFunction)Builder_bel, METH_VARARGS, "BEL and an optional note; bare, the element that follows is dead."},
-    {"enq", (PyCFunction)Builder_enq, METH_VARARGS, "ENQ and a reference: a sequence of one to three names."},
+    {"enq", (PyCFunction)Builder_enq, METH_VARARGS, "ENQ name: a group reference."},
+    {"enq_dle", (PyCFunction)Builder_enq_dle, METH_NOARGS, "ENQ DLE: a pattern; write its lines, then can()."},
     {"syn", (PyCFunction)Builder_syn, METH_NOARGS, "SYN; soh(key), us(value) pairs that follow are the heading."},
     {"eot", (PyCFunction)Builder_eot, METH_NOARGS, "EOT."},
     {"etb", (PyCFunction)Builder_etb, METH_VARARGS, "ETB and an optional plain payload."},
@@ -1053,8 +1330,10 @@ static PyMethodDef Builder_methods[] = {
     {"key_level_open", (PyCFunction)Builder_key_level_open, METH_VARARGS, "SOH key US DLE."},
     {"level_close", (PyCFunction)Builder_level_close, METH_NOARGS, "CAN."},
     {"list", (PyCFunction)Builder_list, METH_VARARGS, "A flat list as the next unit."},
-    {"ref", (PyCFunction)Builder_ref, METH_VARARGS, "ENQ name."},
-    {"ref_path", (PyCFunction)Builder_ref_path, METH_VARARGS, "ENQ STX seg US seg [US seg] ETX."},
+    {"supersede", (PyCFunction)Builder_supersede, METH_VARARGS, "old SUB US new: the next unit, superseded by the one after."},
+    {"ref", (PyCFunction)Builder_ref, METH_VARARGS, "ENQ name as the next unit."},
+    {"ref_open", (PyCFunction)Builder_ref_open, METH_NOARGS, "ENQ DLE as the next unit; write the pattern's lines, then level_close()."},
+    {"ref_record", (PyCFunction)Builder_ref_record, METH_VARARGS, "ENQ DLE GS group RS record [US field] CAN as the next unit."},
     {"note", (PyCFunction)Builder_note, METH_VARARGS, "BEL and the note."},
     {"block", (PyCFunction)Builder_block, METH_VARARGS, "A paragraph: a record of one unit."},
     {"item", (PyCFunction)Builder_item, METH_VARARGS, "A list item: the next unit."},
@@ -1089,12 +1368,14 @@ static PyMethodDef c0_methods[] = {
     {"unit_type", py_unit_type, METH_VARARGS, "Kind of the raw unit [s, e): 0 plain, 1 text, 2 level, 3 ref."},
     {"value", py_value, METH_VARARGS, "Logical value of the raw unit [s, e)."},
     {"unit_level", py_unit_level, METH_VARARGS, "Body range (start, stop) of the level at [s, e)."},
-    {"unit_ref", py_unit_ref, METH_VARARGS, "Segment spans of the reference at [s, e)."},
+    {"unit_ref", py_unit_ref, METH_VARARGS, "The reference at [s, e): (is_pattern, a, b), a name span or a pattern body range."},
     {"unit_list", py_unit_list, METH_VARARGS, "Item spans of the list at [s, e)."},
     {"record_keyed", py_record_keyed, METH_VARARGS, "Whether the record [s, e) is keyed."},
-    {"record_units", py_record_units, METH_VARARGS, "Positional unit spans of the record [s, e)."},
+    {"record_units", py_record_units, METH_VARARGS, "Positional unit spans of the record [s, e), the result."},
+    {"record_written_units", py_record_written_units, METH_VARARGS, "Units as written: (start, end, superseded) each."},
     {"pairs", py_pairs, METH_VARARGS, "Keyed units of [s, e): (ks, ke, vs, ve) each."},
-    {"body_files", py_body_files, METH_VARARGS, "Files of the body [s, e): (ns, ne, start, stop) each."},
+    {"body_read", py_body_read, METH_VARARGS, "Parse [s, e) as a body; raises on malformed input."},
+    {"body_files", py_body_files, METH_VARARGS, "Files of the body [s, e): (ns, ne, start, stop, leading) each."},
     {"file_groups", py_file_groups, METH_VARARGS, "Groups of a file: (depth, ns, ne, start, stop) each."},
     {"body_groups", py_body_groups, METH_VARARGS, "Groups of every file of the body [s, e)."},
     {"body_bare", py_body_bare, METH_VARARGS, "Whether the body [s, e) is a bare record stream."},
@@ -1104,8 +1385,11 @@ static PyMethodDef c0_methods[] = {
     {"document", py_document, METH_VARARGS, "Read the document at start."},
     {"documents", py_documents, METH_VARARGS, "Every document of a container, has_em, em_pos."},
     {"blob", py_blob, METH_VARARGS, "Span of a named blob in the tail."},
-    {"stream", py_stream, METH_VARARGS, "(committed_end, torn, [(start, end, damaged)])."},
-    {"stream_undamaged", py_stream_undamaged, METH_VARARGS, "Undamaged committed blocks as bytes."},
+    {"stream", py_stream, METH_VARARGS, "(committed_end, torn, [(start, end, damaged)], has_damaged, first_damaged, resume_offset)."},
+    {"stream_undamaged", py_stream_undamaged, METH_VARARGS, "Every sound committed block as bytes (continuing past damage)."},
+    {"stream_before_damage", py_stream_before_damage, METH_VARARGS, "The committed blocks before the first damaged one, as bytes."},
+    {"diff_parse", py_diff_parse, METH_VARARGS, "Parse a diff: [(path, [[(old, new|None), ...], ...]), ...]."},
+    {"diff_apply", py_diff_apply, METH_VARARGS, "Apply a diff to [(path, content), ...]; the edited files."},
     {"pretty_format", py_pretty_format, METH_VARARGS, "Format compact bytes as pretty form."},
     {"pretty_parse", py_pretty_parse, METH_VARARGS, "Parse pretty form back to compact bytes."},
     {NULL, NULL, 0, NULL}};
@@ -1127,7 +1411,7 @@ PyMODINIT_FUNC PyInit__c0(void) {
         !import_exc(errors, "UnassignedCodeError", &Exc_Unassigned) ||
         !import_exc(errors, "UnexpectedEndError", &Exc_UnexpectedEnd) ||
         !import_exc(errors, "UnitTypeError", &Exc_UnitType) || !import_exc(errors, "NotFoundError", &Exc_NotFound) ||
-        !import_exc(errors, "BuildError", &Exc_Build)) {
+        !import_exc(errors, "BuildError", &Exc_Build) || !import_exc(errors, "DiffError", &Exc_Diff)) {
         Py_DECREF(errors);
         return NULL;
     }
@@ -1146,5 +1430,7 @@ PyMODINIT_FUNC PyInit__c0(void) {
     PyModule_AddIntConstant(m, "WARN_NO_EOT", C0_WARN_NO_EOT);
     PyModule_AddIntConstant(m, "WARN_UNKNOWN_KEY", C0_WARN_UNKNOWN_KEY);
     PyModule_AddIntConstant(m, "WARN_DUPLICATE_KEY", C0_WARN_DUPLICATE_KEY);
+    PyModule_AddIntConstant(m, "WARN_UNKNOWN_SHAPE", C0_WARN_UNKNOWN_SHAPE);
+    PyModule_AddIntConstant(m, "WARN_UNKNOWN_VERSION", C0_WARN_UNKNOWN_VERSION);
     return m;
 }
