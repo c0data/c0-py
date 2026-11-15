@@ -134,8 +134,8 @@ def validate(buf: Bytes) -> None:
 def canonical(buf: Bytes) -> bool:
     """Whether bytes are a canonical span: well-formed, no layout, one
     spelling per value, unique keys per keyed record, no framing, no notes
-    or dead elements. Supersession is content and is kept. Opt-in: a
-    canonical violation never fails parsing."""
+    or dead elements. A SUB prefix is structure and is kept (``␞a␚␟b``,
+    ``␝a␚␝b``). Opt-in: a canonical violation never fails parsing."""
     return _c0.canonical(buf)
 
 
@@ -246,19 +246,30 @@ class Reference:
 
 
 class Unit:
-    """One positional unit of a record as written: its raw bytes and whether
-    the unit after it supersedes it (``old␚␟new``)."""
+    """One unit with its sub-units (DESIGN.md "Subordinates"): SUB before US
+    makes the unit after a child of the unit before. ``␞a␟b␚␟c`` is two
+    units, and ``b`` holds the sub-unit ``c``; ``␞a␚␟b␚␟c`` is ``a`` holding
+    ``b`` and ``c``; ``␞a␚␟b␚␚␟c`` is ``a`` holding ``b`` holding ``c``. A
+    sub-unit is not a unit of its record. ``raw`` is the unit's own value
+    bytes (sub-units excluded); ``subs`` lists its direct sub-units, each a
+    ``Unit``."""
 
-    __slots__ = ("_buf", "_start", "_end", "superseded")
+    __slots__ = ("_buf", "_start", "_end", "subs")
 
-    def __init__(self, buf: Bytes, start: int, end: int, superseded: bool):
+    def __init__(self, buf: Bytes, start: int, end: int, subs: Sequence["Unit"] = ()):
         self._buf = buf
         self._start = start
         self._end = end
-        self.superseded = superseded
+        self.subs = list(subs)
+
+    @classmethod
+    def _from_tree(cls, buf: Bytes, tree: tuple) -> "Unit":
+        s, e, subs = tree
+        return cls(buf, s, e, [cls._from_tree(buf, t) for t in subs])
 
     @property
     def raw(self) -> memoryview:
+        """The value with its layout, sub-units excluded."""
         return _mv(self._buf)[self._start:self._end]
 
     @property
@@ -270,17 +281,50 @@ class Unit:
         """Logical value; ``UnitTypeError`` for a level or a reference."""
         return _c0.value(self._buf, self._start, self._end)
 
+    def string(self, encoding: str = "utf-8") -> str:
+        return self.value.decode(encoding)
+
+    @property
+    def level(self) -> "Body":
+        """The unit as a nested level: the body between its DLE and CAN."""
+        bs, be = _c0.unit_level(self._buf, self._start, self._end)
+        return Body(self._buf, bs, be, _valid=True)
+
+    @property
+    def list(self) -> list:
+        """The unit as a flat list (``Record.list``)."""
+        return [_c0.value(self._buf, a, b) for a, b in _c0.unit_list(self._buf, self._start, self._end)]
+
+    @property
+    def ref(self) -> "Reference":
+        """The unit as a reference (``Record.ref``)."""
+        is_pattern, a, b = _c0.unit_ref(self._buf, self._start, self._end)
+        if is_pattern:
+            return Reference(None, Body(self._buf, a, b, _valid=True))
+        return Reference(bytes(_mv(self._buf)[a:b]), None)
+
+    def __len__(self) -> int:
+        """Number of direct sub-units."""
+        return len(self.subs)
+
+    def __iter__(self) -> Iterator["Unit"]:
+        return iter(self.subs)
+
     def __repr__(self) -> str:
-        return f"Unit({bytes(self.raw)!r}, superseded={self.superseded})"
+        if self.subs:
+            return f"Unit({bytes(self.raw)!r}, subs={self.subs!r})"
+        return f"Unit({bytes(self.raw)!r})"
 
 
 class Record:
     """A record: positional (units separated by US) or keyed (SOH key US
     value ...), never mixed. Zero-copy accessors over the buffer.
 
-    The positional and keyed accessors report the record's **result**: a
-    superseded unit (``old␚␟new``) and a dead one are not among them;
-    ``units`` lists every positional unit as written.
+    The positional and keyed accessors see the record's **units**: a dead
+    keyed unit is not among them, and neither is a sub-unit (``␞a␟b␚␟c``
+    has two units; ``c`` is a sub-unit of ``b``). ``unit(n)`` and
+    ``unit(key)`` give a unit with its sub-units as a ``Unit``; ``units``
+    lists them all.
 
     Positional access takes an index; keyed access takes a key (``str`` or
     ``bytes``). ``value``, ``string``, ``level``, ``list`` and ``ref`` accept
@@ -323,7 +367,8 @@ class Record:
 
     @property
     def field_count(self) -> int:
-        """Number of positional units of the result (0 for a keyed record)."""
+        """Number of positional units (0 for a keyed record); sub-units are
+        not counted."""
         return len(self._spans())
 
     @property
@@ -334,10 +379,31 @@ class Record:
 
     @property
     def units(self) -> list:
-        """Every positional unit as written, superseded ones included, each
-        a ``Unit`` with its ``superseded`` flag."""
-        return [Unit(self._buf, s, e, sup)
-                for s, e, sup in _c0.record_written_units(self._buf, self._start, self._end)]
+        """Every positional unit with its sub-units, each a ``Unit``."""
+        return [Unit._from_tree(self._buf, t)
+                for t in _c0.record_units_with_subs(self._buf, self._start, self._end)]
+
+    def unit(self, i: Union[int, Str]) -> Unit:
+        """Unit ``i`` with its sub-units: an index, or a key for a keyed
+        record (last wins); on a positional record under a header row, a
+        column name. ``IndexError`` / ``NotFoundError`` when there is none."""
+        if isinstance(i, int):
+            trees = _c0.record_units_with_subs(self._buf, self._start, self._end)
+            return Unit._from_tree(self._buf, trees[i])
+        if not self.keyed:
+            col = self._group.column(i) if self._group is not None else None
+            if col is None:
+                raise NotFoundError(f"no column named {_b(i)!r}")
+            return self.unit(col)
+        needle = _b(i)
+        mv = _mv(self._buf)
+        found = None
+        for ks, ke, tree in _c0.pairs_with_subs(self._buf, self._start, self._end):
+            if bytes(mv[ks:ke]) == needle:
+                found = tree
+        if found is None:
+            raise NotFoundError(f"no key {needle!r}")
+        return Unit._from_tree(self._buf, found)
 
     def field(self, i: int) -> memoryview:
         """Raw unit ``i`` (layout at its edges included)."""
@@ -422,7 +488,7 @@ class Record:
 
     @property
     def keys(self) -> list:
-        """Keys in written order, duplicates included."""
+        """Keys in written order, duplicates included (dead keyed units dropped)."""
         mv = _mv(self._buf)
         return [bytes(mv[ks:ke]) for ks, ke, _, _ in self._pair_spans()]
 
@@ -474,8 +540,10 @@ class Record:
 
 
 class Group:
-    """A group: its depth (GS count; 0 for the unnamed leading group), name,
-    optional header row and records."""
+    """A group: its depth (one plus its SUB prefix, ``␚␝s`` is 2; 0 for the
+    unnamed leading group), name, optional header row and records. A
+    subsection belongs to the group line before it; a depth is never
+    skipped."""
 
     __slots__ = ("_buf", "depth", "_ns", "_ne", "_start", "_stop", "_header", "_records")
 
@@ -620,7 +688,7 @@ class Body:
 
     ``Body(buf)`` parses the slice: the whole grammar is applied and a
     ``C0SyntaxError`` raised on malformed input (parse is validate). The
-    model is the **result**: dead and superseded elements are not in it."""
+    model is the **result**: a dead element is not in it."""
 
     __slots__ = ("_buf", "start", "stop", "_files")
 
@@ -699,8 +767,8 @@ class Body:
 
 class Heading:
     """The heading of a document: keyed units after SYN, in written order,
-    dead and superseded units dropped. Lookups take the last value for a
-    duplicate key."""
+    dead units dropped. Lookups take the last value for a duplicate key.
+    The heading's values take no sub-units."""
 
     __slots__ = ("_buf", "_start", "_end", "_pairs")
 
@@ -829,21 +897,19 @@ class Document:
     ``Container`` for a buffer holding several documents or an EM tail.
     ``warnings`` lists the loud warnings (no SYN, no EOT, unknown keys,
     shape or version, duplicate key). ``dead_elements`` counts the dead
-    records, header rows, groups and files met; ``supersession_grains``
-    lists the codes (US, SOH, RS, GS, FS) at which supersession was met."""
+    records, header rows, groups and files met."""
 
     __slots__ = ("_buf", "start", "stop", "has_syn", "has_eot", "heading", "body", "warnings",
-                 "dead_elements", "supersession_grains")
+                 "dead_elements")
 
     def __init__(self, buf: Bytes, start: int = 0, _parsed: Optional[tuple] = None):
         self._buf = buf
         t = _parsed if _parsed is not None else _c0.document(buf, start)
-        (self.start, self.stop, self.has_syn, self.has_eot, hs, he, bs, be, bits, dead, grains) = t
+        (self.start, self.stop, self.has_syn, self.has_eot, hs, he, bs, be, bits, dead) = t
         self.heading = Heading(buf, hs, he)
         self.body = Body(buf, bs, be, _valid=True)
         self.warnings = self._warnings(bits)
         self.dead_elements = dead
-        self.supersession_grains = [c for c in (US, SOH, RS, GS, FS) if grains & (1 << (c & 31))]
 
     def _warnings(self, bits: int) -> list:
         out = []
@@ -1135,11 +1201,12 @@ class Builder:
         b.rs("Alice").us("1502.30")                        # ␞Alice␟1502.30
         b.rs().soh("host").us("localhost").soh("port").us("5432")
         b.bel().gs("old")                                  # a dead group
-        b.rs("old").sub().us("new")                        # ␞old␚␟new: old superseded by new
+        b.rs("old").sub().us("new")                        # ␞old␚␟new: new is a sub-unit of old
+        b.gs("intro", depth=2)                             # ␚␝intro: a subsection
         b.rs().enq("tags").us().enq(lambda: b.gs("tags").rs("001"))  # ␞␅tags␟␅␐␝tags␞001␘
 
     The composed methods (``file``, ``group``, ``header``, ``record``,
-    ``field``, ``supersede``, ``map``, ``key``, ``level``, ``list``, ``ref``,
+    ``field``, ``sub_unit``, ``map``, ``key``, ``level``, ``list``, ``ref``,
     ``note``) are built on the primitives and cannot write ill-formed output.
     The primitives write what you spell; well-formedness is then yours to
     keep. Both layers share the record state, so they mix.
@@ -1166,13 +1233,14 @@ class Builder:
         self._b.fs(_b(name))
         return self
 
-    def gs(self, name: Optional[Str] = None) -> "Builder":
-        """GS and, when given, a group name: ``gs().gs("sub")`` is a group at
-        depth 2. Ends any open record."""
-        if name is None:
-            self._b.gs()
-        else:
-            self._b.gs(_b(name))
+    def gs(self, name: Optional[Str] = None, depth: int = 1) -> "Builder":
+        """GS and, when given, a group name, prefixed by ``depth - 1`` SUB:
+        ``gs("s", depth=2)`` is ``␚␝s``, a subsection of the group before
+        it. A bare ``gs()`` is an empty-named group (``␝␝b`` is group ``""``
+        then group ``b``), not a depth. Ends any open record."""
+        if depth < 1:
+            raise ValueError("depth must be at least 1")
+        self._b.gs(None if name is None else _b(name), depth)
         return self
 
     def rs(self, value: Optional[Str] = None) -> "Builder":
@@ -1193,10 +1261,11 @@ class Builder:
         return self
 
     def sub(self) -> "Builder":
-        """SUB: the element before the next separator or opener is
-        superseded by the one after it. ``rs("old").sub().us("new")`` writes
-        ``␞old␚␟new``; before ``rs``, ``gs``, ``fs`` or ``soh`` it supersedes
-        at that grain."""
+        """SUB: the element after the next separator is subordinate to the
+        one before it, at that code's grain. ``rs("old").sub().us("new")``
+        writes ``␞old␚␟new``, ``new`` a sub-unit of ``old``; ``sub().gs("s")``
+        writes ``␚␝s``, a subsection; a run of SUB is the depth. Before
+        ``rs``, ``fs`` or ``soh`` it is reserved (the reader refuses it)."""
         self._b.sub()
         return self
 
@@ -1281,18 +1350,16 @@ class Builder:
         return self.fs(name)
 
     def group(self, name: Str, headers: Optional[Iterable[Str]] = None, depth: int = 1) -> "Builder":
-        """GS (repeated ``depth`` times) and a name, then a header row when given."""
-        if depth < 1:
-            raise ValueError("depth must be at least 1")
-        for _ in range(depth - 1):
-            self._b.gs()
-        self._b.gs(_b(name))
+        """A group at ``depth`` (``depth - 1`` SUB, GS and the name), then a
+        header row when given. A depth is at most one more than the group
+        line before it."""
+        self.gs(name, depth)
         if headers is not None:
             self.header(headers)
         return self
 
     def section(self, name: Str, depth: int = 1) -> "Builder":
-        """Document mode: a section at depth."""
+        """Document mode: a section at ``depth`` (``␚␝name`` at depth 2)."""
         return self.group(name, None, depth)
 
     def header(self, *names) -> "Builder":
@@ -1313,10 +1380,16 @@ class Builder:
         self._b.field(_b(value))
         return self
 
-    def supersede(self, old: Str, new: Str) -> "Builder":
-        """A superseded unit: ``old`` superseded by ``new``, written
-        ``old␚␟new`` as the next unit and the one after it."""
-        self._b.supersede(_b(old), _b(new))
+    def sub_unit(self, value: Optional[Str] = None, depth: int = 1) -> "Builder":
+        """A sub-unit of the unit just written: ``depth`` SUB, US and the
+        value (``field("a").sub_unit("b")`` writes ``␞a␚␟b``; ``depth=2`` is
+        a sub-unit of the sub-unit before). Not a unit of the record: the
+        unit count is unchanged. Opens a record if none is open, the first
+        unit existing even when empty (``␞␚␟new``). ``None`` is an empty
+        sub-unit (``␞old␚␟``)."""
+        if depth < 1:
+            raise ValueError("depth must be at least 1")
+        self._b.sub_unit(b"" if value is None else _b(value), depth)
         return self
 
     def map(self, pairs=None, **kw) -> "Builder":

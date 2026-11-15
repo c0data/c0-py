@@ -1,6 +1,6 @@
-"""The 1.0 redesign at c0-spec 7b13feb, mirroring c0-cr's spec/redesign_spec.cr:
-supersession, the result model, reference patterns, damaged stream blocks,
-parse-is-validate, and C0DIFF."""
+"""The 1.0 redesign at c0-spec f677533, mirroring c0-cr's spec/redesign_spec.cr:
+subordinates (SUB), the result model, reference patterns, damaged stream
+blocks, parse-is-validate, and C0DIFF."""
 
 import os
 import tempfile
@@ -11,44 +11,93 @@ import c0
 P = c0.pretty_parse
 
 
-class Supersession(unittest.TestCase):
-    def test_drops_the_superseded_element_from_the_model_and_keeps_it_in_the_bytes(self):
-        doc = c0.Document(P("␝g␞a␟b␚␟c␚␞x␟y"))
-        g = doc.group("g")
-        self.assertEqual(g.record_count, 1)
-        self.assertEqual(g.record(0).values, [b"x", b"y"])
-        self.assertEqual(doc.supersession_grains, [c0.US, c0.RS])
-        rec = c0.Body(P("␞a␚␟b␟c")).record(0)
-        self.assertEqual(rec.values, [b"b", b"c"])
+class Subordinates(unittest.TestCase):
+    def test_reads_sub_gs_as_a_subsection_and_sub_us_as_a_sub_unit(self):
+        doc = c0.Document(P("␝g␞a␟b␚␟c␚␝s␞x"))
+        self.assertEqual([(g.name, g.depth) for g in doc.groups], [(b"g", 1), (b"s", 2)])
+        rec = doc.group("g").record(0)
+        self.assertEqual(rec.values, [b"a", b"b"])
         self.assertEqual(rec.field_count, 2)
-        self.assertEqual([(u.value, u.superseded) for u in rec.units], [(b"a", True), (b"b", False), (b"c", False)])
-        self.assertIsInstance(rec.units[0], c0.Unit)
-        self.assertIsInstance(rec.units[0].raw, memoryview)
-        # supersession is content: canonical form keeps it, pretty round-trips it
+        self.assertEqual([u.value for u in rec.unit(1).subs], [b"c"])
+        self.assertEqual(rec.unit(0).subs, [])
+        self.assertEqual([(u.value, [s.value for s in u.subs]) for u in rec.units], [(b"a", []), (b"b", [b"c"])])
+        self.assertIsInstance(rec.units[1], c0.Unit)
+        self.assertIsInstance(rec.units[1].raw, memoryview)
+        self.assertIsInstance(rec.unit(1).subs[0], c0.Unit)
+        self.assertEqual(bytes(rec.unit(1).raw), b"b")
+        self.assertEqual(len(rec.unit(1)), 1)
+        self.assertEqual([s.string() for s in rec.unit(1)], ["c"])
+        with self.assertRaises(IndexError):
+            rec.unit(2)
+        # nested: the SUB run is the depth; several sub-units on one unit
+        rec = c0.Body(P("␞a␚␟b␚␚␟c␟d")).record(0)
+        self.assertEqual(rec.values, [b"a", b"d"])
+        self.assertEqual([u.value for u in rec.unit(0).subs[0].subs], [b"c"])
+        self.assertEqual([u.value for u in c0.Body(P("␞a␚␟b␚␟c")).record(0).unit(0).subs], [b"b", b"c"])
+        # the first unit exists even when empty; a sub-unit may be empty or hold a level
+        self.assertEqual(c0.Body(P("␞␚␟new")).record(0).values, [b""])
+        self.assertEqual([u.value for u in c0.Body(P("␞␚␟new")).record(0).unit(0).subs], [b"new"])
+        self.assertEqual([u.value for u in c0.Body(P("␞old␚␟")).record(0).unit(0).subs], [b""])
+        sub = c0.Body(P("␞a␚␟␐␞x␘")).record(0).unit(0).subs[0]
+        self.assertEqual(sub.unit_type, c0.UnitType.LEVEL)
+        self.assertEqual(sub.level.record(0).values, [b"x"])
+        # a keyed unit's value takes sub-units; a dead keyed unit takes its sub-units with it
+        rec = c0.Body(P("␞␁k␟v␚␟w")).record(0)
+        self.assertEqual(rec.pairs, [(b"k", b"v")])
+        self.assertEqual([u.value for u in rec.unit("k").subs], [b"w"])
+        self.assertEqual([u.value for u in rec.unit(b"k").subs], [b"w"])
+        with self.assertRaises(c0.NotFoundError):
+            rec.unit("nope")
+        self.assertEqual(c0.Body(P("␞␇␁k␟v␚␟w␁z␟1")).record(0).keys, [b"z"])
+        # a column name under a header row
+        g = c0.Body(P("␁␞n␟m␞1␟2␚␟3")).group(0)
+        self.assertEqual([u.value for u in g.record(0).unit("m").subs], [b"3"])
+        # a SUB prefix is structure: canonical form keeps it; pretty round-trips it
         self.assertTrue(c0.canonical(P("␞a␚␟b")))
-        buf = P("␝g␞a␚␟b␚␞x␝h␚␝i␖␁k␟1␚␁k␟2␞z")
-        self.assertEqual(c0.pretty_parse(c0.pretty_format(P("␝g␞a␚␟b␚␞x␝h␚␝i"))), P("␝g␞a␚␟b␚␞x␝h␚␝i"))
-        self.assertEqual(c0.pretty_parse(c0.pretty_format(P("␖␁k␟1␚␁k␟2␞z"))), P("␖␁k␟1␚␁k␟2␞z"))
-        del buf
+        self.assertTrue(c0.canonical(P("␝a␚␝b␞x")))
+        self.assertTrue(c0.canonical(P("␝␝b␞x")))
+        self.assertFalse(c0.canonical(b"\x1ea\x1a \x1fb"))  # layout after SUB, as after every code
+        self.assertEqual(c0.Body(b"\x1ea\x1a \x1fb").record(0).unit(0).subs[0].value, b"b")
+        for s in ("␝g␞a␚␟b␚␚␟c␞x␚␝h␚␚␝i␞␁k␟1␚␟2", "␖␁k␟1␞z␚␟y␄"):
+            self.assertEqual(c0.pretty_parse(c0.pretty_format(P(s))), P(s))
+        # GS repetition is an empty-named group, not depth
+        self.assertEqual([(g.name, g.depth) for g in c0.Body(P("␝␝b␞x")).groups], [(b"", 1), (b"b", 1)])
+        self.assertEqual([(g.name, g.depth) for g in c0.Body(P("␝a␚␝b␚␚␝c␝d")).groups],
+                         [(b"a", 1), (b"b", 2), (b"c", 3), (b"d", 1)])
+        # the builder writes the prefix
+        self.assertEqual(c0.build(lambda b: b.gs("a").gs("s", depth=2).rs("x").sub_unit("y")), P("␝a␚␝s␞x␚␟y"))
+        self.assertEqual(c0.build(lambda b: (b.group("a"), b.group("s", ["h"], depth=2), b.section("t", depth=3))),
+                         P("␝a␚␝s␁␞h␚␚␝t"))
+        self.assertEqual(c0.build(lambda b: (b.record("a"), b.sub_unit("b"), b.sub_unit("c", depth=2), b.field("d"))),
+                         P("␞a␚␟b␚␚␟c␟d"))
+        self.assertEqual(c0.build(lambda b: b.sub_unit("new")), P("␞␚␟new"))
+        self.assertEqual(c0.build(lambda b: (b.record("old"), b.sub_unit())), P("␞old␚␟"))
+        self.assertEqual(c0.build(lambda b: (b.record("a", "b"), b.sub_unit("c"), b.field("d"))), P("␞a␟b␚␟c␟d"))
+        with self.assertRaises(ValueError):
+            c0.Builder().sub_unit("x", depth=0)
+        with self.assertRaises(ValueError):
+            c0.Builder().gs("x", depth=0)
+        self.assertFalse(hasattr(c0.Builder(), "supersede"))
+        self.assertFalse(hasattr(c0.Document(P("␞a")), "supersession_grains"))
 
-    def test_chaining_keeps_the_last_and_empty_sides_are_empty_units(self):
-        self.assertEqual(c0.Body(P("␞a␚␟b␚␟c")).record(0).values, [b"c"])
-        self.assertEqual(c0.Body(P("␞a␚␟")).record(0).values, [b""])
-        self.assertEqual(c0.Body(P("␞␚␟b")).record(0).values, [b"b"])
-        rec = c0.Body(P("␞␁k␟1␚␁k␟2␁j␟3")).record(0)
-        self.assertEqual(rec.pairs, [(b"k", b"2"), (b"j", b"3")])
-        body = c0.Body(P("␜a␞1␚␜b␞2"))
-        self.assertEqual([f.name for f in body.files], [b"b"])
-        self.assertEqual(c0.Document(P("␖␁shape␟diff␚␁shape␟stream␞a")).shape, "stream")
-
-    def test_nothing_to_supersede_and_sub_elsewhere_are_errors(self):
+    def test_reserved_grains_skips_and_dead_units_are_errors(self):
         for bad in ("␝g␚␞x", "␚␝g", "␚␜f", "␞a␚", "␞a␚␇n␟b", "␞a␚␗", "␞a␚␄", "␞a␟␐␞b␘␚␘", "␁␞a␚␁␞b",
-                    "␞a␚␚␟b", "␝g␇␞a␚␞x", "␞␅␐␝a␚␝b␘"):
+                    "␞a␚␚␟b", "␝a␚␚␝c", "␜f␚␝g", "␝a␝b␚␚␝c", "␞a␚␞b", "␜a␚␜b", "␞␁k␟v␚␁j␟w", "␚␁␞h",
+                    "␇␚␟c", "␞a␇␚␟c", "␚␇␝b", "␖␁schema␟a␚␟b␞x", "␞a␚␟b␚␚␚␟c",
+                    "␞a␟␅␐␝g␞3␚␟x␘", "␞a␟␅␐␝g␞␁k␟␚␟x␘", "␞␅␐␝a␚␝b␘␚"):
             with self.subTest(bad):
                 with self.assertRaises(c0.C0SyntaxError):
                     c0.Body(P(bad))
                 with self.assertRaises(c0.C0SyntaxError):
                     c0.validate(P(bad))
+        # not errors: a dead group line keeps its prefix; a subsection under a dead group dies with it
+        self.assertEqual([g.name for g in c0.Body(P("␝a␞1␇␚␝s␞2␝b␞3")).groups], [b"a", b"b"])
+        self.assertEqual([g.name for g in c0.Body(P("␝x␇␚␝draft␚␚␝notes␝y")).groups], [b"x", b"y"])
+        self.assertEqual(c0.Document(P("␝x␇␚␝draft␚␚␝notes␝y")).dead_elements, 1)
+        # a pattern spells depth the same way
+        r = c0.Body(P("␞␅␐␝docs␚␝intro␞3␘")).record(0).ref(0)
+        self.assertEqual(r.path, [b"docs", b"intro", b"3"])
+        self.assertEqual([(g.name, g.depth) for g in r.pattern.groups], [(b"docs", 1), (b"intro", 2)])
 
     def test_parse_is_validate_and_canonical_is_opt_in(self):
         with self.assertRaises(c0.C0SyntaxError):
@@ -165,8 +214,8 @@ class Diff(unittest.TestCase):
             ("header row", "␜f␁␞x␞a␚␟b"),
             ("level", "␜f␞␐␞a␘␚␟b"),
             ("reference", "␜f␞␅a␚␟b"),
-            ("chained", "␜f␞a␚␟b␚␟c"),
-            ("record grain", "␜f␞a␚␞b"),
+            ("two sub-units", "␜f␞a␚␟b␚␟c"),
+            ("nested sub-unit", "␜f␞a␚␟b␚␚␟c"),
             ("dead record", "␜f␇␞a␚␟b"),
             ("dead file", "␜f␞a␚␟b␇␜g"),
             ("record before FS", "␞a␚␟b␜f"),
@@ -181,6 +230,10 @@ class Diff(unittest.TestCase):
                     c0.diff.apply(P(bad), files)
         with self.assertRaises(c0.C0SyntaxError):
             c0.diff.apply(P("␜f␞a␚b"), files)
+        with self.assertRaises(c0.C0SyntaxError):
+            c0.diff.apply(P("␜f␞a␚␞b"), files)  # SUB before RS is a reserved grain
+        with self.assertRaises(c0.C0SyntaxError):
+            c0.diff.apply(P("␜f␞a␚␟b␚␜g"), files)  # SUB before FS too
         # a hunk kept without applying: a text note
         self.assertEqual(c0.diff.apply(P("␜f␇␂␞a␚␟b␃␞a␚␟x"), {"f": "a"}), {"f": "x"})
         # a diff with no files is a no-op

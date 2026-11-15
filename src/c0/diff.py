@@ -2,18 +2,20 @@
 
 A diff is an ordinary C0DATA document of ``shape`` ``diff``: files (FS, the
 path) of records (RS), each record one anchored pattern of US-separated
-units, an anchor or a substitution written as supersession at the unit
-grain, ``old␚␟new``. A record's search text (its anchors and olds) must
-match exactly once from the previous record's match to the end of the
-file; the replacement puts each new in place of its old. A record with no
-substitution is an assertion. Notes are allowed; everything the text diff
-does not use is refused (``DiffError``): keyed units, levels, references,
-header rows, GS, supersession at another grain, chained supersession, dead
-records and dead file lines (a hunk is kept without applying by writing it
-in a note, ``␇␂␞…␃``), a record before the first FS, an empty path, the
-same path twice, an empty search text, a bare insertion, ``␟␚␟``, a second
-document after the diff's EOT. There is no replace-all: a tool expands one
-into anchored records against the target.
+units: a unit with no sub-unit is an anchor; one with a sub-unit,
+``old␚␟new``, is a substitution (``new`` is the sub-unit of ``old``). A
+record's search text (its anchors and olds) must match exactly once from
+the previous record's match to the end of the file; the replacement puts
+each new in place of its old. A record with no substitution is an
+assertion. Notes are allowed; everything the text diff does not use is
+refused (``DiffError``): keyed units, levels, references, header rows, GS,
+two sub-units on one unit, a sub-unit of a sub-unit, dead records and dead
+file lines (a hunk is kept without applying by writing it in a note,
+``␇␂␞…␃``), a record before the first FS, an empty path, the same path
+twice, an empty search text, a bare insertion, ``␟␚␟``, a second document
+after the diff's EOT. SUB before RS, FS or SOH is a reserved grain and a
+``C0SyntaxError``. There is no replace-all: a tool expands one into
+anchored records against the target.
 
 >>> import c0
 >>> diff = c0.diff.build(lambda d: (
@@ -51,7 +53,7 @@ def _b(s: Str) -> bytes:
 
 class Unit:
     """One unit of a pattern: an anchor (``new`` is None) or a substitution
-    ``old␚␟new``. Values are decoded bytes."""
+    ``old␚␟new``, ``new`` the sub-unit of ``old``. Values are decoded bytes."""
 
     __slots__ = ("old", "new")
 
@@ -80,12 +82,12 @@ class Pattern:
 
     @property
     def search(self) -> bytes:
-        """What the file must hold, once: anchors and superseded units."""
+        """What the file must hold, once: anchors and olds."""
         return b"".join(u.old for u in self.units)
 
     @property
     def replacement(self) -> bytes:
-        """What it will hold: superseding units in place of superseded ones."""
+        """What it will hold: each sub-unit in place of the unit that holds it."""
         return b"".join(u.old if u.new is None else u.new for u in self.units)
 
     @property
@@ -183,9 +185,10 @@ class PatternBuilder:
         return self
 
     def sub(self, old: Str, new: Str) -> "PatternBuilder":
-        """``old␚␟new``: ``old`` replaced by ``new``. Either may be empty
-        (an insertion after the anchor before it, or a deletion), not both."""
-        self._b.supersede(old, new)
+        """``old␚␟new``: ``old`` replaced by ``new``, written as the unit
+        ``old`` holding the sub-unit ``new``. Either may be empty (an
+        insertion after the anchor before it, or a deletion), not both."""
+        self._b.field(old).sub_unit(new)
         return self
 
 
@@ -255,14 +258,15 @@ class DiffBuilder:
         self._b.rs()
         if _b(before):
             self._b.field(before)
-        self._b.supersede(old, new)
+        self._b.field(old).sub_unit(new)
         if _b(after):
             self._b.field(after)
         return self
 
     def insert_after(self, anchor: Str, text: Str) -> "DiffBuilder":
-        """One record: insert ``text`` after ``anchor`` (``␞anchor␟␚␟text``)."""
-        self._b.rs().field(anchor).supersede("", text)
+        """One record: insert ``text`` after ``anchor`` (``␞anchor␟␚␟text``:
+        an empty unit holding the sub-unit ``text``)."""
+        self._b.rs().field(anchor).field("").sub_unit(text)
         return self
 
     def delete(self, old: Str, before: Str = "", after: Str = "") -> "DiffBuilder":

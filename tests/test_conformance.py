@@ -23,12 +23,11 @@ def scalar_bytes(f):
 
 
 def flat_groups(groups, depth=1):
-    """Flatten a group list with "sections" into (depth, group) pairs. A
-    section with a null name is a skipped depth: no group stands there."""
+    """Flatten a group list with "sections" (SUB GS subsections) into
+    (depth, group) pairs."""
     out = []
     for g in groups:
-        if g["name"] is not None:
-            out.append((depth, g))
+        out.append((depth, g))
         if "sections" in g:
             out.extend(flat_groups(g["sections"], depth + 1))
     return out
@@ -37,9 +36,27 @@ def flat_groups(groups, depth=1):
 class Checks(unittest.TestCase):
     """Shared checkers over the decoded structure."""
 
+    def check_unit(self, u, f):
+        """A unit with sub-units: {"value": v, "subs": [...]}, nested."""
+        if scalar(f):
+            self.assertEqual(u.value, scalar_bytes(f))
+            self.assertEqual(u.subs, [])
+        elif "subs" in f:
+            self.check_unit(c0.Unit(u._buf, u._start, u._end), f["value"])
+            self.assertEqual(len(u.subs), len(f["subs"]))
+            for sub, sf in zip(u.subs, f["subs"]):
+                self.check_unit(sub, sf)
+        elif "level" in f:
+            self.check_body(u.level, f["level"])
+        else:
+            raise ValueError("unknown sub-unit form %r" % (f,))
+
     def check_value(self, rec, i, f):
         if scalar(f):
             self.assertEqual(rec.value(i), scalar_bytes(f))
+            self.assertEqual(rec.unit(i).subs, [])
+        elif "subs" in f:
+            self.check_unit(rec.unit(i), f)
         elif "level" in f:
             self.check_body(rec.level(i), f["level"])
         elif "ref" in f:
@@ -66,7 +83,10 @@ class Checks(unittest.TestCase):
             self.assertEqual(rec.keys, [p[0].encode() for p in pairs])
             got = rec.pairs
             for j, p in enumerate(pairs):
-                self.assertEqual(got[j][1], scalar_bytes(p[1]))
+                if scalar(p[1]):
+                    self.assertEqual(got[j][1], scalar_bytes(p[1]))
+                else:
+                    self.check_unit(rec.unit(p[0]), p[1])
 
     def check_group(self, g, e):
         self.assertEqual(g.name, e["name"].encode())

@@ -47,13 +47,15 @@ print(c0.pretty_format(buf))                            # Unicode Control Pictur
 
 The model is the **result**: a dead element (`␇␞…`) is parsed and dropped
 with everything it holds (a dead group takes its header row, records and
-subsections, a dead file its groups), and a superseded one (`old␚␟new`,
-`␚␁`, `␚␞`, `␚␝`, `␚␜`: SUB before a separator or opener replaces the
-element before it with the one after) is dropped in favour of the one that
-supersedes it. `rec.units` lists a record's units as written, each with
-`superseded`. Supersession is content: canonical form keeps it and it
-hashes as written. Canonical checking is opt-in (`c0.canonical`) and never
-fails parsing.
+subsections, a dead file its groups). SUB makes the element after it a
+child of the element before, at that code's grain: `␚␝s` is a subsection
+at depth two (`g.depth`; a run of SUB is the depth, never skipped), and
+`␞a␟b␚␟c` is two units with `c` a sub-unit of `b`, not a unit of the
+record (`field_count`, `values`, `pairs` see units only). `rec.unit(n)` and
+`rec.unit(key)` give a `Unit` with its `subs`, each a `Unit` in turn;
+`rec.units` lists them all. `␚␞`, `␚␜` and `␚␁` are reserved and refused.
+A SUB prefix is structure: canonical form keeps it. Canonical checking is
+opt-in (`c0.canonical`) and never fails parsing.
 
 Values are written in their one spelling: plain when they can be, text
 (`␂…␃`) when they hold a control byte or edge whitespace. Keyed records
@@ -92,8 +94,9 @@ out, `b.ref("tags", "001", "label")` (`␅␐␝tags␞001␟label␘`) or any p
 built in a callable, `b.ref(lambda: b.gs("s").rs().soh("host").us())`
 (`␅␐␝s␞␁host␟␘`). `Record.ref` reads one back as a `Reference` with a
 `name` or a `pattern` (the level as a `Body`); `ref.path` linearises it and
-`ref.is_group` says whether it names a group as a whole. `b.supersede("old",
-"new")` writes `old␚␟new`.
+`ref.is_group` says whether it names a group as a whole. `b.sub_unit("new")`
+writes `␚␟new`, a sub-unit of the unit just written (`depth=2` one deeper);
+`b.group("intro", depth=2)` writes `␚␝intro`, a subsection.
 
 The builder also has `file`, `section`, `header`, `field`, `key`, `note`,
 `etb(payload)`, `em(tail)`, `block` and `item`, matching the Crystal reference.
@@ -116,8 +119,9 @@ b.gs("users").soh().rs("name").us("amount")                 # ␝users␁␞name
 b.rs("cfg").us().dle().rs().soh("b").us("2").can()          # ␞cfg␟␐␞␁b␟2␘
 b.bel("checked").rs("x")                                    # ␇checked␞x: a note
 b.bel().gs("old")                                           # ␇␝old: a dead group
-b.rs("old").sub().us("new")                                 # ␞old␚␟new: old superseded by new
-b.gs().gs("sub").rs().enq("users").us().enq(lambda: b.gs("users").rs("1"))  # ␝␝sub␞␅users␟␅␐␝users␞1␘
+b.rs("old").sub().us("new")                                 # ␞old␚␟new: new is a sub-unit of old
+b.gs("top").gs("sub", depth=2)                              # ␝top␚␝sub: a subsection
+b.gs("sub").rs().enq("users").us().enq(lambda: b.gs("users").rs("1"))  # ␝sub␞␅users␟␅␐␝users␞1␘
 b.syn().soh("version").us("1").rs("a").eot()                # ␖␁version␟1␞a␄
 ```
 
@@ -146,7 +150,7 @@ Requires a C compiler and the Python development headers.
 
 A diff (`DIFF.md`) is an ordinary document of `shape` `diff`: files of
 records, each record one anchored pattern whose substitutions are written
-as supersession at the unit grain.
+as a sub-unit, `old␚␟new`: `new` is the sub-unit of `old`.
 
 ```
 ␖␁shape␟diff
@@ -172,7 +176,7 @@ Each record's search text must match once from the previous match to the
 end of the file. There is no replace-all: a tool expands one into anchored
 records against the target (DIFF.md). Anything the text diff does not use
 (keyed units, levels, references, header rows, GS, dead records and dead
-file lines, supersession at another grain, chained supersession, an empty
+file lines, two sub-units on one unit, a sub-unit of a sub-unit, an empty
 search text, a bare insertion, `␟␚␟`, a record before the first FS, an
 empty path, the same path twice) is refused with `c0.DiffError`; a hunk is
 kept without applying by writing it in a note, `␇␂␞…␃`.
@@ -195,14 +199,14 @@ the offset to resume at (`r.resume_offset`); with
 
 ## Status
 
-Binds the c0-c 1.0 core at c0-spec 7b13feb: one parser (parse is validate),
+Binds the c0-c 1.0 core at c0-spec f677533: one parser (parse is validate),
 zero-copy body/document/container readers reporting the result model
-(files, groups, header rows, positional and keyed records with their units
-as written, nested levels, reference patterns, headings with `schema`, EM
-blobs), supersession at every grain, canonical check, the builder, ETB
-stream mode with damaged blocks, pretty form (`pretty_format` /
-`pretty_parse`) and C0DIFF (`c0.diff`). Passes all 277 shared conformance
-vectors from [c0-spec](https://github.com/c0data/c0-spec).
+(files, groups with SUB GS depth, header rows, positional and keyed records
+with their units and sub-units, nested levels, reference patterns, headings
+with `schema`, EM blobs), canonical check, the builder, ETB stream mode
+with damaged blocks, pretty form (`pretty_format` / `pretty_parse`) and
+C0DIFF (`c0.diff`). Passes all 295 shared conformance vectors from
+[c0-spec](https://github.com/c0data/c0-spec).
 
 Converters (CSV / JSON) are not yet wrapped.
 

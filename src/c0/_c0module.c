@@ -402,28 +402,94 @@ static PyObject *py_record_units(PyObject *self, PyObject *args) {
     return out;
 }
 
-/* Every positional unit of the record [s, e) as written: a list of
- * (start, end, superseded). */
-static PyObject *py_record_written_units(PyObject *self, PyObject *args) {
+/* A unit with its sub-units as a tree: (start, end, [sub-tree, ...]), the
+ * span being the unit's value with its layout (its sub-units excluded) and
+ * the list its direct sub-units in written order, each such a tree. */
+static PyObject *unit_tree(const c0_unit *u, const uint8_t *base) {
+    PyObject *subs = PyList_New(0), *out;
+    c0_sub_iter it;
+    c0_unit sub;
+    Py_ssize_t s;
+    if (!subs) return NULL;
+    it = c0_unit_subs(*u);
+    while (c0_next_sub(&it, &sub)) {
+        if (append_steal(subs, unit_tree(&sub, base)) != 0) {
+            Py_DECREF(subs);
+            return NULL;
+        }
+    }
+    if (it.err.code) {
+        Py_DECREF(subs);
+        return raise_status(it.err.code, &it.err);
+    }
+    s = (Py_ssize_t)(u->raw.ptr - base);
+    out = Py_BuildValue("(nnN)", s, s + (Py_ssize_t)u->raw.len, subs);
+    return out;
+}
+
+/* Every positional unit of the record [s, e) with its sub-units: a list of
+ * unit trees (start, end, [sub-tree, ...]). */
+static PyObject *py_record_units_with_subs(PyObject *self, PyObject *args) {
     Py_buffer v;
     Py_ssize_t s, e;
     c0_unit_iter it;
-    c0_bytes raw;
-    int sup;
+    c0_unit u;
     const uint8_t *base;
     PyObject *out;
     (void)self;
     if (!parse_range(args, &v, &s, &e)) return NULL;
     base = (const uint8_t *)v.buf;
-    it = c0_record_written_units(record_of(&v, s, e));
+    it = c0_record_units(record_of(&v, s, e));
     out = PyList_New(0);
     if (!out) {
         PyBuffer_Release(&v);
         return NULL;
     }
-    while (c0_next_written_unit(&it, &raw, &sup)) {
-        Py_ssize_t us = (Py_ssize_t)(raw.ptr - base);
-        if (append_steal(out, Py_BuildValue("(nnO)", us, us + (Py_ssize_t)raw.len, sup ? Py_True : Py_False)) != 0) {
+    while (c0_next_unit_with_subs(&it, &u)) {
+        if (append_steal(out, unit_tree(&u, base)) != 0) {
+            Py_DECREF(out);
+            PyBuffer_Release(&v);
+            return NULL;
+        }
+    }
+    PyBuffer_Release(&v);
+    if (it.err.code) {
+        Py_DECREF(out);
+        return raise_status(it.err.code, &it.err);
+    }
+    return out;
+}
+
+/* Keyed units of the range [s, e) with their sub-units: a list of
+ * (key_start, key_end, value_start, value_end, [sub-tree, ...]). */
+static PyObject *py_pairs_with_subs(PyObject *self, PyObject *args) {
+    Py_buffer v;
+    Py_ssize_t s, e;
+    c0_pair_iter it;
+    c0_bytes k;
+    c0_unit u;
+    const uint8_t *base;
+    PyObject *out;
+    (void)self;
+    if (!parse_range(args, &v, &s, &e)) return NULL;
+    base = (const uint8_t *)v.buf;
+    it = c0_record_pairs(record_of(&v, s, e));
+    out = PyList_New(0);
+    if (!out) {
+        PyBuffer_Release(&v);
+        return NULL;
+    }
+    while (c0_next_pair_with_subs(&it, &k, &u)) {
+        Py_ssize_t ks = (Py_ssize_t)(k.ptr - base);
+        PyObject *tree = unit_tree(&u, base), *item;
+        if (!tree) {
+            Py_DECREF(out);
+            PyBuffer_Release(&v);
+            return NULL;
+        }
+        item = Py_BuildValue("(nnO)", ks, ks + (Py_ssize_t)k.len, tree);
+        Py_DECREF(tree);
+        if (append_steal(out, item) != 0) {
             Py_DECREF(out);
             PyBuffer_Release(&v);
             return NULL;
@@ -655,15 +721,15 @@ static PyObject *py_group_records(PyObject *self, PyObject *args) {
 /* ---- documents and containers --------------------------------------------- */
 
 static PyObject *document_tuple(const c0_document *d) {
-    return Py_BuildValue("(nnOOnnnnInI)", (Py_ssize_t)d->start, (Py_ssize_t)d->stop,
+    return Py_BuildValue("(nnOOnnnnIn)", (Py_ssize_t)d->start, (Py_ssize_t)d->stop,
                          d->has_syn ? Py_True : Py_False, d->has_eot ? Py_True : Py_False,
                          (Py_ssize_t)d->heading_start, (Py_ssize_t)d->heading_end,
                          (Py_ssize_t)d->body.start, (Py_ssize_t)d->body.stop, d->warnings,
-                         (Py_ssize_t)d->dead_elements, d->sup_grains);
+                         (Py_ssize_t)d->dead_elements);
 }
 
 /* Read the document at `start`: (start, stop, has_syn, has_eot, heading_start,
- * heading_end, body_start, body_stop, warning_bits, dead_elements, sup_grains). */
+ * heading_end, body_start, body_stop, warning_bits, dead_elements). */
 static PyObject *py_document(PyObject *self, PyObject *args) {
     Py_buffer v;
     Py_ssize_t start = 0;
@@ -1112,7 +1178,32 @@ BUILDER_NOARGS_METHOD(enq_dle, c0_builder_enq_dle)
 BUILDER_NOARGS_METHOD(syn, c0_builder_syn)
 BUILDER_NOARGS_METHOD(eot, c0_builder_eot)
 BUILDER_NOARGS_METHOD(ref_open, c0_build_ref_open)
-BUILDER_OPT_BYTES_METHOD(gs, c0_builder_gs, c0_builder_gs_name)
+
+/* gs([name], depth=1): depth-1 SUB, then GS and the name when given. A SUB
+ * prefix makes the group a subsection of the group before it. */
+static PyObject *Builder_gs(BuilderObject *self, PyObject *args) {
+    PyObject *nameobj = Py_None;
+    Py_buffer v = {0};
+    Py_ssize_t depth = 1, i;
+    if (!PyArg_ParseTuple(args, "|On", &nameobj, &depth)) return NULL;
+    if (depth < 1) {
+        PyErr_SetString(PyExc_ValueError, "depth must be at least 1");
+        return NULL;
+    }
+    if (nameobj != Py_None && PyObject_GetBuffer(nameobj, &v, PyBUF_SIMPLE) != 0) return NULL;
+    if (!builder_open(self)) {
+        if (v.obj) PyBuffer_Release(&v);
+        return NULL;
+    }
+    for (i = 1; i < depth; i++) c0_builder_sub(&self->b);
+    if (v.obj) {
+        c0_builder_gs_name(&self->b, (const uint8_t *)v.buf, (size_t)v.len);
+        PyBuffer_Release(&v);
+    } else {
+        c0_builder_gs(&self->b);
+    }
+    return builder_check(self);
+}
 BUILDER_OPT_BYTES_METHOD(rs, c0_builder_rs, c0_builder_rs_value)
 BUILDER_OPT_BYTES_METHOD(us, c0_builder_us, c0_builder_us_value)
 BUILDER_OPT_BYTES_METHOD(soh, c0_builder_soh, c0_builder_soh_name)
@@ -1203,18 +1294,21 @@ static PyObject *Builder_ref_record(BuilderObject *self, PyObject *args) {
     return builder_check(self);
 }
 
-/* old␚␟new: the next unit, superseded by the one after it. */
-static PyObject *Builder_supersede(BuilderObject *self, PyObject *args) {
-    Py_buffer o, n;
-    if (!PyArg_ParseTuple(args, "y*y*", &o, &n)) return NULL;
-    if (!builder_open(self)) {
-        PyBuffer_Release(&o);
-        PyBuffer_Release(&n);
+/* sub_unit(value, depth=1): SUB x depth, US and the value: a sub-unit of the
+ * unit just written (depth 2: of the sub-unit before). Not a unit of the
+ * record. Opens a record if none is open: the first unit exists even when
+ * empty, so `␞␚␟new` is reachable. */
+static PyObject *Builder_sub_unit(BuilderObject *self, PyObject *args) {
+    Py_buffer v;
+    Py_ssize_t depth = 1;
+    if (!PyArg_ParseTuple(args, "y*|n", &v, &depth)) return NULL;
+    if (!builder_open(self) || depth < 1) {
+        PyBuffer_Release(&v);
+        if (depth < 1 && !PyErr_Occurred()) PyErr_SetString(PyExc_ValueError, "depth must be at least 1");
         return NULL;
     }
-    c0_build_supersede(&self->b, (const uint8_t *)o.buf, (size_t)o.len, (const uint8_t *)n.buf, (size_t)n.len);
-    PyBuffer_Release(&o);
-    PyBuffer_Release(&n);
+    c0_build_sub_unit(&self->b, (const uint8_t *)v.buf, (size_t)v.len, (size_t)depth);
+    PyBuffer_Release(&v);
     return builder_check(self);
 }
 
@@ -1303,10 +1397,10 @@ static PyObject *Builder_close(BuilderObject *self, PyObject *noargs) {
 static PyMethodDef Builder_methods[] = {
     /* primitives: one per code; the bare form writes the code alone */
     {"fs", (PyCFunction)Builder_fs, METH_VARARGS, "FS name; ends any open record."},
-    {"gs", (PyCFunction)Builder_gs, METH_VARARGS, "GS and an optional group name; gs(), gs(name) is depth 2."},
+    {"gs", (PyCFunction)Builder_gs, METH_VARARGS, "gs([name], depth=1): depth-1 SUB, then GS and an optional group name; a bare GS is an empty-named group."},
     {"rs", (PyCFunction)Builder_rs, METH_VARARGS, "RS and an optional first value: opens a record."},
     {"us", (PyCFunction)Builder_us, METH_VARARGS, "US and an optional value."},
-    {"sub", (PyCFunction)Builder_sub, METH_NOARGS, "SUB: the element before the next separator or opener is superseded by the one after."},
+    {"sub", (PyCFunction)Builder_sub, METH_NOARGS, "SUB: the element after the next separator is subordinate to the one before (before GS a subsection, before US a sub-unit)."},
     {"soh", (PyCFunction)Builder_soh, METH_VARARGS, "SOH and an optional key; bare before rs() it opens a header row."},
     {"dle", (PyCFunction)Builder_dle, METH_NOARGS, "DLE: open a level (saves the record state)."},
     {"can", (PyCFunction)Builder_can, METH_NOARGS, "CAN: close the innermost level; BuildError if none is open."},
@@ -1320,7 +1414,7 @@ static PyMethodDef Builder_methods[] = {
     /* composed: built on the primitives, cannot write ill-formed output */
     {"file", (PyCFunction)Builder_file, METH_VARARGS, "FS name."},
     {"group", (PyCFunction)Builder_group, METH_VARARGS, "GS name."},
-    {"section", (PyCFunction)Builder_section, METH_VARARGS, "GS x depth, name."},
+    {"section", (PyCFunction)Builder_section, METH_VARARGS, "SUB x (depth-1), GS name: a group at depth."},
     {"header", (PyCFunction)Builder_header, METH_VARARGS, "SOH RS name US name ..."},
     {"record", (PyCFunction)Builder_record, METH_VARARGS, "RS and the given units."},
     {"field", (PyCFunction)Builder_field, METH_VARARGS, "The next unit of the open record."},
@@ -1330,7 +1424,7 @@ static PyMethodDef Builder_methods[] = {
     {"key_level_open", (PyCFunction)Builder_key_level_open, METH_VARARGS, "SOH key US DLE."},
     {"level_close", (PyCFunction)Builder_level_close, METH_NOARGS, "CAN."},
     {"list", (PyCFunction)Builder_list, METH_VARARGS, "A flat list as the next unit."},
-    {"supersede", (PyCFunction)Builder_supersede, METH_VARARGS, "old SUB US new: the next unit, superseded by the one after."},
+    {"sub_unit", (PyCFunction)Builder_sub_unit, METH_VARARGS, "sub_unit(value, depth=1): SUB x depth, US, value: a sub-unit of the unit just written; not a unit."},
     {"ref", (PyCFunction)Builder_ref, METH_VARARGS, "ENQ name as the next unit."},
     {"ref_open", (PyCFunction)Builder_ref_open, METH_NOARGS, "ENQ DLE as the next unit; write the pattern's lines, then level_close()."},
     {"ref_record", (PyCFunction)Builder_ref_record, METH_VARARGS, "ENQ DLE GS group RS record [US field] CAN as the next unit."},
@@ -1371,9 +1465,10 @@ static PyMethodDef c0_methods[] = {
     {"unit_ref", py_unit_ref, METH_VARARGS, "The reference at [s, e): (is_pattern, a, b), a name span or a pattern body range."},
     {"unit_list", py_unit_list, METH_VARARGS, "Item spans of the list at [s, e)."},
     {"record_keyed", py_record_keyed, METH_VARARGS, "Whether the record [s, e) is keyed."},
-    {"record_units", py_record_units, METH_VARARGS, "Positional unit spans of the record [s, e), the result."},
-    {"record_written_units", py_record_written_units, METH_VARARGS, "Units as written: (start, end, superseded) each."},
+    {"record_units", py_record_units, METH_VARARGS, "Positional unit spans of the record [s, e); sub-units are not among them."},
+    {"record_units_with_subs", py_record_units_with_subs, METH_VARARGS, "Positional units with their sub-units: (start, end, [sub-tree, ...]) each, nested."},
     {"pairs", py_pairs, METH_VARARGS, "Keyed units of [s, e): (ks, ke, vs, ve) each."},
+    {"pairs_with_subs", py_pairs_with_subs, METH_VARARGS, "Keyed units with their sub-units: (ks, ke, vs, ve, [sub-tree, ...]) each."},
     {"body_read", py_body_read, METH_VARARGS, "Parse [s, e) as a body; raises on malformed input."},
     {"body_files", py_body_files, METH_VARARGS, "Files of the body [s, e): (ns, ne, start, stop, leading) each."},
     {"file_groups", py_file_groups, METH_VARARGS, "Groups of a file: (depth, ns, ne, start, stop) each."},

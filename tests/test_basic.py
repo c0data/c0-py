@@ -147,8 +147,9 @@ class Basic(unittest.TestCase):
         self.assertTrue(g.is_group)
         self.assertEqual(g.group_name, b"tags")
         # a pattern built freely: a file, two group depths, a keyed step
-        buf = c0.build(lambda b: (b.record("x"), b.ref(lambda: b.fs("f").gs("a").gs().gs("b").rs().soh("host").us())))
+        buf = c0.build(lambda b: (b.record("x"), b.ref(lambda: b.fs("f").gs("a").gs("b", depth=2).rs().soh("host").us())))
         self.assertEqual(c0.pretty_format(buf, mode=c0.PrettyMode.COMPACT).count("␅"), 1)
+        self.assertEqual(c0.pretty_format(buf, mode=c0.PrettyMode.COMPACT).count("␚"), 1)
         self.assertEqual(c0.Body(buf).record(0).ref(1).path, [b"f", b"a", b"b", b"host"])
         # the text form is an error; so is a value inside a pattern
         with self.assertRaises(c0.C0SyntaxError):
@@ -214,8 +215,11 @@ class Basic(unittest.TestCase):
         self.assertEqual(g.record(0).values, [b"Alice", b"", b"100"])
         self.assertFalse(c0.canonical(buf))
         # dead means the element and everything it holds
-        body = c0.Body(c0.pretty_parse("␇␝old␁␞h␞1␝␝deeper␞2␝new␞3"))
+        body = c0.Body(c0.pretty_parse("␇␝old␁␞h␞1␚␝deeper␞2␝new␞3"))
         self.assertEqual([g.name for g in body.groups], [b"new"])
+        # GS repetition is an empty-named group at depth 1, so it ends the dead group
+        body = c0.Body(c0.pretty_parse("␇␝old␞1␝␝other␞2"))
+        self.assertEqual([(g.name, g.depth) for g in body.groups], [(b"", 1), (b"other", 1)])
         body = c0.Body(c0.pretty_parse("␇␜a␝g␞1␜b␞2"))
         self.assertEqual([f.name for f in body.files], [b"b"])
         self.assertEqual(c0.Document(c0.pretty_parse("␇␜a␝g␞1␜b␞2")).dead_elements, 1)
@@ -301,14 +305,17 @@ class Basic(unittest.TestCase):
     def test_builder_parity_bytes(self):
         b = c0.Builder()
         b.section("Intro").section("Deep", depth=2).block("text\x1e").item("one")
-        self.assertEqual(b.bytes, b"\x1dIntro\x1d\x1dDeep\x1e\x02text\x1e\x03\x1fone")
+        self.assertEqual(b.bytes, b"\x1dIntro\x1a\x1dDeep\x1e\x02text\x1e\x03\x1fone")
         self.assertEqual(bytes(c0.Builder().etb()), b"\x17")
         self.assertEqual(c0.Builder().etb("a1b2").bytes, b"\x17a1b2")
         self.assertEqual(c0.Builder().syn([("shape", "diff")]).bytes, b"\x16\x01shape\x1fdiff")
         self.assertEqual(c0.Builder().record().field("a").field("b").bytes, b"\x1ea\x1fb")
         self.assertEqual(c0.Builder().record(["a", b"b"]).bytes, b"\x1ea\x1fb")
         self.assertEqual(c0.Builder().record().key("a", "1").key("b", "2").bytes, b"\x1e\x01a\x1f1\x01b\x1f2")
-        self.assertEqual(c0.Builder().group("g", ["x"], depth=2).bytes, b"\x1d\x1dg\x01\x1ex")
+        self.assertEqual(c0.Builder().group("g", ["x"], depth=2).bytes, b"\x1a\x1dg\x01\x1ex")
+        self.assertEqual(c0.Builder().gs("g", depth=3).bytes, b"\x1a\x1a\x1dg")
+        self.assertEqual(c0.Builder().gs(depth=2).bytes, b"\x1a\x1d")
+        self.assertEqual(c0.Builder().record("a").sub_unit("b").bytes, b"\x1ea\x1a\x1fb")
 
     def test_builder_close_and_leak_loop(self):
         b = c0.Builder()
@@ -346,9 +353,10 @@ class Basic(unittest.TestCase):
             b.syn(schema="ledger"),
             b.group("g", ["a", "b"]), b.record("x", "y\x1fz"),
             b.record("n"), b.level(lambda l: l.record("1", "2")),
-            b.record("old"), b.sub(), b.record("new"),
-            b.record("a"), b.supersede("b", "c"), b.ref("g", "x"),
-            b.sub(), b.group("h"), b.record("1"),
+            b.record("old"), b.sub_unit("new"), b.sub_unit("newer", depth=2),
+            b.record("a"), b.field("b"), b.sub_unit("c"), b.ref("g", "x"),
+            b.group("h", depth=2), b.record("1"),
+            b.gs("i", depth=3), b.record("2"), b.gs(), b.record("3"),
             b.eot(),
         ))
         pretty = c0.pretty_format(buf)

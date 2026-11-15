@@ -33,14 +33,16 @@ class Primitives(unittest.TestCase):
                           "␇␝old␞1␝new␞2")
         self.assertSpells(build(lambda b: b.gs().gs("sub").rs().enq("users").us().enq(lambda: b.gs("users").rs("1"))),
                           "␝␝sub␞␅users␟␅␐␝users␞1␘")
+        self.assertSpells(build(lambda b: b.gs("top").sub().gs("sub").sub().sub().gs("deep")), "␝top␚␝sub␚␚␝deep")
         self.assertSpells(build(lambda b: b.syn().soh("version").us("1").rs("a").eot()),
                           "␖␁version␟1␞a␄")
-        # supersession: SUB before a separator or opener, at every grain
+        # subordinates: SUB before US is a sub-unit, before GS a depth prefix; a run is the depth
         self.assertSpells(build(lambda b: b.rs("old").sub().us("new")), "␞old␚␟new")
-        self.assertSpells(build(lambda b: b.fs("f").rs("a").sub().rs("b").gs("x").sub().gs("y").sub().fs("g")),
-                          "␜f␞a␚␞b␝x␚␝y␚␜g")
-        self.assertSpells(build(lambda b: b.rs().soh("k").us("1").sub().soh("k").us("2")), "␞␁k␟1␚␁k␟2")
-        self.assertSpells(build(lambda b: b.rs("old").sub()), "␞old␚")
+        self.assertSpells(build(lambda b: b.rs("a").sub().us("b").sub().sub().us("c").us("d")), "␞a␚␟b␚␚␟c␟d")
+        self.assertSpells(build(lambda b: b.rs().soh("k").us("1").sub().us("2")), "␞␁k␟1␚␟2")
+        self.assertSpells(build(lambda b: b.gs("x").sub().gs("y").rs("1")), "␝x␚␝y␞1")
+        self.assertSpells(build(lambda b: b.rs().sub().us("new")), "␞␚␟new")
+        self.assertSpells(build(lambda b: b.rs("old").sub().us()), "␞old␚␟")
         self.assertSpells(build(lambda b: b.rs("a").etb("c1").rs("b").etb()), "␞a␗c1␞b␗")
         self.assertEqual(build(lambda b: b.rs("a").em(b"\xff\x00tail")), b"\x1ea\x19\xff\x00tail")
 
@@ -106,7 +108,9 @@ class Primitives(unittest.TestCase):
             b.list(["x", "y"]),
             b.ref("users", "1"),
             b.level(lambda l: l.record("i")),
-            b.supersede("p", "q"),
+            b.field("p"), b.sub_unit("q"),
+            b.group("sub", depth=2),
+            b.record("s"),
             b.eot(),
         ))
         lo = build(lambda b: (
@@ -115,6 +119,7 @@ class Primitives(unittest.TestCase):
             b.gs("cfg").rs().soh("host").us("localhost").soh("port").us("5432"),
             b.rs("r").us().dle().rs("x").us("y").can().us().enq(lambda: b.gs("users").rs("1")).us().dle().rs("i").can(),
             b.us("p").sub().us("q"),
+            b.sub().gs("sub").rs("s"),
             b.eot(),
         ))
         self.assertEqual(lo, hi)
@@ -124,7 +129,8 @@ class Primitives(unittest.TestCase):
         b = c0.Builder()
         for r in (b.syn(), b.soh("k"), b.us("v"), b.fs("f"), b.gs(), b.gs("g"), b.rs(), b.us(),
                   b.rs("a"), b.dle(), b.can(), b.bel(), b.rs("x"), b.sub(), b.us("n"), b.bel("n"), b.rs("y"), b.us(),
-                  b.enq("g"), b.us(), b.enq(lambda: b.gs("g")), b.supersede("o", "n"), b.ref("g"), b.ref("g", "1"),
+                  b.enq("g"), b.us(), b.enq(lambda: b.gs("g")), b.sub_unit("n"), b.sub_unit(), b.ref("g"), b.ref("g", "1"),
+                  b.gs("s", depth=2), b.gs(depth=2),
                   b.ref(lambda: b.gs("g")), b.eot(), b.etb(), b.etb("p"), b.em(b"")):
             self.assertIs(r, b)
         b.close()
